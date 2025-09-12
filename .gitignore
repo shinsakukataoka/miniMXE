@@ -1,0 +1,19 @@
+# Results & data
+results/
+traces/
+features.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Local env/config
+env.mk
+
+# Editors/OS
+*.swp
+.DS_Store
+.vscode/
+.idea/
+
