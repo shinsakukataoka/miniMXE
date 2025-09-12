@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Unified pipeline: SPEC build (if needed), DynamoRIO trace+features, Sniper sims, summaries
 
 set -euo pipefail
 

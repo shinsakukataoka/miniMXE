@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import sys, re, math, argparse, os, csv
 
 def parse_simout(path: str):

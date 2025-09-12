@@ -3,7 +3,6 @@ SHELL := /bin/bash
 .ONESHELL:
 -include env.mk
 
-# -------- Defaults (override in env.mk or on the CLI) --------
 SPEC_ROOT        ?= $(HOME)/spec2017
 DR_HOME          ?= $(HOME)/opt/DynamoRIO-Linux-11.3.0-1
 SNIPER_HOME      ?= $(HOME)/src/sniper
