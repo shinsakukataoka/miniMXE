@@ -69,4 +69,3 @@ if args.out_csv:
         if write_hdr: w.writerow(hdr)
         w.writerow(row_energy)
         w.writerow(row_ed2p)
-

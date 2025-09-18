@@ -1,6 +1,7 @@
 # Use bash and keep each recipe in a single shell
 SHELL := /bin/bash
 .ONESHELL:
+
 -include env.mk
 
 SPEC_ROOT        ?= $(HOME)/spec2017
@@ -20,7 +21,7 @@ FEATURES_M  ?= 10
 BUILD_IF_NEEDED ?= 1
 
 # JanS LLC overrides
-JANS_L3_SIZE ?= 2097152
+JANS_L3_SIZE ?= 16777216
 JANS_L3_ASSOC ?= 16
 JANS_L3_LAT ?= 8
 
@@ -43,19 +44,19 @@ sanity:
 	mkdir -p "$(OUT_ROOT)" "$(TMPDIR)" traces
 	# Source SPEC shrc from inside SPEC_ROOT so it detects the correct tree
 	if [[ -f "$(SPEC_ROOT)/shrc" ]]; then \
-		pushd "$(SPEC_ROOT)" >/dev/null; \
-		. ./shrc; \
-		popd >/dev/null; \
+	  pushd "$(SPEC_ROOT)" >/dev/null; \
+	  . ./shrc; \
+	  popd >/dev/null; \
 	else \
-		echo "[ERR] SPEC shrc not found at $(SPEC_ROOT)/shrc"; \
-		exit 1; \
+	  echo "[ERR] SPEC shrc not found at $(SPEC_ROOT)/shrc"; \
+	  exit 1; \
 	fi
 	"$(DR_HOME)/bin64/drrun" -version >/dev/null && echo "[OK] DynamoRIO" || { echo "[ERR] DynamoRIO"; exit 1; }
 	command -v runcpu >/dev/null && echo "[OK] SPEC runcpu" || { echo "[ERR] SPEC runcpu"; exit 1; }
 	if ldd "$(SNIPER_HOME)/lib/sniper" 2>/dev/null | grep -qi sqlite; then \
-		echo "[OK] sqlite visible to Sniper"; \
+	  echo "[OK] sqlite visible to Sniper"; \
 	else \
-		echo "[WARN] sqlite not in Sniper link; using LD_LIBRARY_PATH=$(CONDA_SQLITE_LIB)"; \
+	  echo "[WARN] sqlite not in Sniper link; using LD_LIBRARY_PATH=$(CONDA_SQLITE_LIB)"; \
 	fi
 	echo "[OK] Sanity checks complete."
 
@@ -66,6 +67,7 @@ run: sanity
 	  --gcc-dir "$(GCC_DIR)" --conda-sqlite-lib "$(CONDA_SQLITE_LIB)" --tmpdir "$(TMPDIR)" \
 	  --out-root "$(OUT_ROOT)" --features-csv "$(FEATURES_CSV)" \
 	  --trace-sec "$(TRACE_SEC)" --features-M "$(FEATURES_M)" \
+	  --sram-l3-size "$(SRAM_L3_SIZE)" \
 	  --jans-l3-size "$(JANS_L3_SIZE)" --jans-l3-assoc "$(JANS_L3_ASSOC)" --jans-l3-lat "$(JANS_L3_LAT)" \
 	  $(if $(BUILD_IF_NEEDED),--build-if-needed,)
 
