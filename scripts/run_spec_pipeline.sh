@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- Parse args --------
-BENCH=""; N_M=""
+# -------- Defaults --------
+BENCH=""; N_M=""; CMD=""; CWD=""
 SPEC_ROOT="${SPEC_ROOT:-$HOME/spec2017}"
 DR_HOME="${DR_HOME:-$HOME/opt/DynamoRIO-Linux-11.3.0-1}"
 SNIPER_HOME="${SNIPER_HOME:-$HOME/src/sniper}"
@@ -14,30 +14,42 @@ FEATURES_CSV="${FEATURES_CSV:-$PWD/features.csv}"
 TRACE_SEC="${TRACE_SEC:-4}"
 FEATURES_M="${FEATURES_M:-10}"
 BUILD_IF_NEEDED=0
+SIM_N="${SIM_N:-1}"
+SPEC_SIZE="${SPEC_SIZE:-test}"   # test | train | ref
 
-# JanS (MRAM-ish) knobs
-JANS_L3_SIZE="${JANS_L3_SIZE:-16777216}"   # bytes (default 16MB)
+# SRAM baseline knobs (size-aware)
+SRAM_L3_SIZE="${SRAM_L3_SIZE:-$((8192*1024))}"   # bytes; convert to KB
+SRAM_L3_LAT="${SRAM_L3_LAT:-6}"
+
+# --- Asymmetric LLC hit cycles (defaults keep symmetric behavior) ---
+SRAM_L3_LAT_RD="${SRAM_L3_LAT_RD:-$SRAM_L3_LAT}"
+SRAM_L3_LAT_WR="${SRAM_L3_LAT_WR:-$SRAM_L3_LAT}"
+
+# JanS knobs
+JANS_L3_SIZE="${JANS_L3_SIZE:-16777216}"         # bytes; convert to KB (16 MB default)
 JANS_L3_ASSOC="${JANS_L3_ASSOC:-16}"
-JANS_L3_LAT="${JANS_L3_LAT:-8}"           # cycles; used as data_access_time and LLC hit cycles
+JANS_L3_LAT="${JANS_L3_LAT:-8}"                  # cycles
+L3_TAGS_CYC="${L3_TAGS_CYC:-2}"                  # tags_access_time (cycles)
 
-# New knobs (args) for experiments
-SRAM_L3_LAT="${SRAM_L3_LAT:-6}"           # LLC hit cycles for baseline
-L3_TAGS_CYC="${L3_TAGS_CYC:-2}"           # tags_access_time (cycles) when we set it
-WARMUP_M="${WARMUP_M:-0}"                 # million instr warmup before measured ROI (0 = none)
-ENABLE_LLC_ENERGY="${ENABLE_LLC_ENERGY:-0}"  # 1 to also pass llc e_* keys via -g
-SRAM_L3_SIZE="${SRAM_L3_SIZE:-$((8192*1024))}"  # 8 MB default
+# --- Asymmetric for JanS as well (defaults to symmetric) ---
+JANS_L3_LAT_RD="${JANS_L3_LAT_RD:-$JANS_L3_LAT}"
+JANS_L3_LAT_WR="${JANS_L3_LAT_WR:-$JANS_L3_LAT}"
 
-# Optional energy constants (only used if ENABLE_LLC_ENERGY=1)
+# ROI/warmup
+WARMUP_M="${WARMUP_M:-0}"                         # million instr warmup before ROI (0 = none)
+
+# Optional: LLC energy model flags
+ENABLE_LLC_ENERGY="${ENABLE_LLC_ENERGY:-0}"
 SRAM_E_READ="${SRAM_E_READ:-565}"
 SRAM_E_WRITE="${SRAM_E_WRITE:-537}"
 SRAM_E_MISS="${SRAM_E_MISS:-11}"
 SRAM_P_LEAK="${SRAM_P_LEAK:-3438}"
-
 JANS_E_READ="${JANS_E_READ:-188}"
 JANS_E_WRITE="${JANS_E_WRITE:-2305}"
 JANS_E_MISS="${JANS_E_MISS:-77}"
 JANS_P_LEAK="${JANS_P_LEAK:-48}"
 
+# -------- Arg parse --------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bench) BENCH="$2"; shift 2;;
@@ -55,17 +67,25 @@ while [[ $# -gt 0 ]]; do
     --jans-l3-size) JANS_L3_SIZE="$2"; shift 2;;
     --jans-l3-assoc) JANS_L3_ASSOC="$2"; shift 2;;
     --jans-l3-lat) JANS_L3_LAT="$2"; shift 2;;
-    --sram-l3-lat) SRAM_L3_LAT="$2"; shift 2;;
+    --jans-l3-lat-rd) JANS_L3_LAT_RD="$2"; shift 2;;
+    --jans-l3-lat-wr) JANS_L3_LAT_WR="$2"; shift 2;;
     --sram-l3-size) SRAM_L3_SIZE="$2"; shift 2;;
+    --sram-l3-lat) SRAM_L3_LAT="$2"; shift 2;;
+    --sram-l3-lat-rd) SRAM_L3_LAT_RD="$2"; shift 2;;
+    --sram-l3-lat-wr) SRAM_L3_LAT_WR="$2"; shift 2;;
     --l3-tags-cyc) L3_TAGS_CYC="$2"; shift 2;;
     --warmup-m) WARMUP_M="$2"; shift 2;;
     --enable-llc-energy) ENABLE_LLC_ENERGY=1; shift;;
     --build-if-needed) BUILD_IF_NEEDED=1; shift;;
+    --cmd) CMD="$2"; shift 2;;
+    --cwd) CWD="$2"; shift 2;;
+    --sim-n) SIM_N="$2"; shift 2;;
+    --spec-size) SPEC_SIZE="$2"; shift 2;;
     *) echo "[ERR] Unknown arg: $1"; exit 1;;
   esac
 done
 
-[[ -z "$BENCH" || -z "$N_M" ]] && { echo "Usage: $0 --bench <BENCH> --n-m <N_MILLION> [opts...]"; exit 1; }
+[[ -z "$BENCH" || -z "$N_M" ]] && { echo "Usage: $0 --bench <LABEL|SPEC_BENCH> --n-m <N_MILLION> [--cmd <full command>] [--cwd <dir>] [--sim-n <cores>] [--build-if-needed] [opts...]"; exit 1; }
 
 info(){ echo -e "$*"; }
 ok(){   echo -e "\e[32m[OK]\e[0m $*"; }
@@ -82,7 +102,7 @@ OUT_JANS="$OUT_ROOT/${SHORT}_JanS_cap_approx_${N_M}M"
 STOP_ICOUNT="$(( N_M * 1000000 ))"
 TIMINGS_CSV="$OUT_ROOT/timings.csv"
 
-# Build the -s argument: with warmup if WARMUP_M>0, else plain stop-by-icount
+# Stop spec string
 if [[ "${WARMUP_M}" =~ ^[0-9]+$ ]] && [[ "$WARMUP_M" -gt 0 ]]; then
   STOP_SPEC="stop-by-icount:${N_M}M:${WARMUP_M}M"
 else
@@ -108,63 +128,87 @@ timelog_run(){  # timelog_run <label> <csv> -- <cmd...>
 # -------- Sanity --------
 info "\n==== Sanity checks ===="
 "$DR_HOME/bin64/drrun" -version >/dev/null && ok "DynamoRIO OK" || { err "DynamoRIO not found"; exit 1; }
-if [[ -f "$SPEC_ROOT/shrc" ]]; then
-  pushd "$SPEC_ROOT" >/dev/null
-  . ./shrc
-  popd >/dev/null
-else
-  err "SPEC shrc not found at $SPEC_ROOT/shrc"
-  exit 1
+if [[ -z "$CMD" ]]; then
+  if [[ -f "$SPEC_ROOT/shrc" ]]; then
+    pushd "$SPEC_ROOT" >/dev/null; . ./shrc; popd >/dev/null
+  else
+    err "SPEC shrc not found at $SPEC_ROOT/shrc"; exit 1
+  fi
+  command -v runcpu >/dev/null && ok "SPEC runcpu OK" || { err "SPEC runcpu missing"; exit 1; }
 fi
-command -v runcpu >/dev/null && ok "SPEC runcpu OK" || { err "SPEC runcpu missing"; exit 1; }
 if ldd "$SNIPER_HOME/lib/sniper" 2>/dev/null | grep -qi sqlite; then
   ok "sqlite visible to Sniper"
 else
   warn "sqlite NOT found by ldd on sniper; using LD_LIBRARY_PATH=$CONDA_SQLITE_LIB"
 fi
 
-# -------- Locate/build run dir --------
-info "\n==== Locate (or build) $BENCH ===="
-BENCH_DIR="$SPEC_ROOT/benchspec/CPU/$BENCH"
-RUN_ROOT="$BENCH_DIR/run"
-if [[ ! -d "$RUN_ROOT" ]] || ! ls -dt "$RUN_ROOT"/run_* >/dev/null 2>&1; then
-  if [[ $BUILD_IF_NEEDED -eq 1 ]]; then
-    pushd "$SPEC_ROOT" >/dev/null
-    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size test --action build "$BENCH"
-    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size test --action run   "$BENCH"
-    popd >/dev/null
+# -------- Locate workload --------
+info "\n==== Locate workload ===="
+if [[ -z "$CMD" ]]; then
+  # SPEC path
+  BENCH_DIR="$SPEC_ROOT/benchspec/CPU/$BENCH"
+  RUN_ROOT="$BENCH_DIR/run"
+  if [[ ! -d "$RUN_ROOT" ]] || ! ls -dt "$RUN_ROOT"/run_* >/dev/null 2>&1; then
+    if [[ $BUILD_IF_NEEDED -eq 1 ]]; then
+      pushd "$SPEC_ROOT" >/dev/null
+      runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size "$SPEC_SIZE" --action build "$BENCH"
+      runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size "$SPEC_SIZE" --action run   "$BENCH"
+      popd >/dev/null
+    else
+      err "No run_* dir and --build-if-needed not set"; exit 1
+    fi
+  fi
+  RUN_DIR="$(ls -dt "$RUN_ROOT"/run_* | head -1)"
+  [[ -d "$RUN_DIR" ]] || { err "Run dir not found"; exit 1; }
+  ok "Run dir: $RUN_DIR"
+else
+  # Generic command path
+  RUN_DIR="${CWD:-$PWD}"
+  ok "CWD: $RUN_DIR"
+fi
+
+# -------- Resolve command (SPEC vs generic) --------
+ARGS=""; APP=""; declare -a APP_CMD
+if [[ -z "$CMD" ]]; then
+  # SPEC
+  mapfile -t BIN_CANDIDATES < <(find "$RUN_DIR" -maxdepth 2 -type f -name '*_base.*' | sort)
+  [[ ${#BIN_CANDIDATES[@]} -gt 0 ]] || { err "No *_base.* binary in $RUN_DIR"; exit 1; }
+  BIN="${BIN_CANDIDATES[0]}"; ok "Binary : $BIN"
+
+  if [[ -f "$RUN_DIR/speccmds.cmd" ]]; then
+    LINE=$(grep -m1 -E '../run_base[^ ]+/[^ ]+_base[^ ]+|./[^ ]+_base[^ ]+' "$RUN_DIR/speccmds.cmd" || true)
+    if [[ -n "${LINE:-}" ]]; then
+      LINE_TRIM="${LINE%%>*}"
+      ARGS="$(echo "$LINE_TRIM" | sed -E 's@.*_base[^ ]+[[:space:]]*(.*)$@\1@' | xargs || true)"
+    fi
+  fi
+  [[ -z "${ARGS:-}" && -f "$RUN_DIR/test.txt" ]] && ARGS="test.txt"
+  [[ -z "${ARGS:-}" && -f "$RUN_DIR/test.sgf" ]] && ARGS="test.sgf"
+  if [[ "$BENCH" == "648.exchange2_s" && -z "${ARGS:-}" ]]; then ARGS="2"; fi
+  ok "Args    : ${ARGS:-<none>}"
+  APP="$(basename "$BIN")"
+  APP_CMD=("$BIN" ${ARGS:+$ARGS})
+else
+  ok "Command : $CMD"
+  CMD_EXPANDED="$(bash -lc 'printf %s "$CMD"')"
+  read -r -a TOK <<< "$CMD_EXPANDED"
+  if [[ ${#TOK[@]} -gt 0 ]] && command -v "${TOK[0]}" >/dev/null 2>&1; then
+    APP_CMD=("${TOK[@]}")
+    APP="$(basename "${TOK[0]}")"
+    ok "Resolved exec: ${APP_CMD[*]}"
   else
-    err "No run_* dir and --build-if-needed not set"
-    exit 1
+    APP_CMD=(/bin/bash -lc "$CMD")
+    FIRST="$(awk '{print $1}' <<< "$CMD")"
+    APP="$(basename "$FIRST")"
+    warn "Falling back to shell launch via /bin/bash -lc"
   fi
 fi
 
-RUN_DIR="$(ls -dt "$RUN_ROOT"/run_* | head -1)"
-[[ -d "$RUN_DIR" ]] || { err "Run dir not found"; exit 1; }
-ok "Run dir: $RUN_DIR"
-
-# -------- Find binary & args --------
-mapfile -t BIN_CANDIDATES < <(find "$RUN_DIR" -maxdepth 2 -type f -name '*_base.*' | sort)
-[[ ${#BIN_CANDIDATES[@]} -gt 0 ]] || { err "No *_base.* binary in $RUN_DIR"; exit 1; }
-BIN="${BIN_CANDIDATES[0]}"; ok "Binary : $BIN"
-
-ARGS=""
-if [[ -f "$RUN_DIR/speccmds.cmd" ]]; then
-  LINE=$(grep -m1 -E '../run_base[^ ]+/[^ ]+_base[^ ]+|./[^ ]+_base[^ ]+' "$RUN_DIR/speccmds.cmd" || true)
-  if [[ -n "${LINE:-}" ]]; then
-    LINE_TRIM="${LINE%%>*}"
-    ARGS="$(echo "$LINE_TRIM" | sed -E 's@.*_base[^ ]+[[:space:]]*(.*)$@\1@' | xargs || true)"
-  fi
-fi
-[[ -z "${ARGS:-}" && -f "$RUN_DIR/test.txt" ]] && ARGS="test.txt"
-[[ -z "${ARGS:-}" && -f "$RUN_DIR/test.sgf" ]] && ARGS="test.sgf"
-# exchange2_s needs an integer; fallback if no args present
-if [[ "$BENCH" == "648.exchange2_s" && -z "${ARGS:-}" ]]; then ARGS="2"; fi
-ok "Args    : ${ARGS:-<none>}"
-
-# -------- (Optional) Native timing (no tools) --------
+# -------- Native timing (no tools) --------
 info "\n==== Native timing (no tools) ===="
-timelog_run "native" "$TIMINGS_CSV" -- "$BIN" ${ARGS:+$ARGS} || true
+pushd "$RUN_DIR" >/dev/null
+timelog_run "native" "$TIMINGS_CSV" -- "${APP_CMD[@]}" || true
+popd >/dev/null
 
 # -------- DynamoRIO trace + features --------
 info "\n==== DynamoRIO (${TRACE_SEC}s text trace) + features ===="
@@ -172,17 +216,20 @@ pushd "$RUN_DIR" >/dev/null
 set +e
 timelog_run "drrun_memtrace_${TRACE_SEC}s" "$TIMINGS_CSV" -- \
   "$DR_HOME/bin64/drrun" -root "$DR_HOME" -follow_children -c "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" -- \
-  /usr/bin/timeout "${TRACE_SEC}s" "$BIN" ${ARGS:+$ARGS}
+  /usr/bin/timeout "${TRACE_SEC}s" "${APP_CMD[@]}"
 RC=$?
 set -e
 if   [[ $RC -eq 124 ]]; then ok "Trace stopped at timeout (rc=124)"
 elif [[ $RC -eq 0   ]]; then ok "Trace completed before timeout"
 else err "DynamoRIO run failed (rc=$RC)"; popd >/dev/null; exit $RC; fi
 
-APP="$(basename "$BIN")"
-TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*"$APP"*.log 2>/dev/null | head -1 || true)"
+# Find trace file robustly: look in DR samples dir and CWD; prefer one matching APP, else newest
+TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*"$APP"*.log "$RUN_DIR"/memtrace.*"$APP"*.log 2>/dev/null | head -1 || true)"
+if [[ -z "${TRACEFILE:-}" ]]; then
+  TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*.log "$RUN_DIR"/memtrace.*.log 2>/dev/null | head -1 || true)"
+fi
 if [[ -z "${TRACEFILE:-}" || ! -f "$TRACEFILE" ]]; then
-  warn "No memtrace log found for $APP in $DR_HOME/samples/bin64"
+  warn "No memtrace log found for $APP in either $DR_HOME/samples/bin64 or $RUN_DIR"
 else
   ok "Using trace: $TRACEFILE"
   mkdir -p "$OUT_ROOT/traces"
@@ -192,27 +239,25 @@ else
 fi
 popd >/dev/null
 
-echo ">>> PIPELINE SIZES: SRAM=${SRAM_L3_SIZE:-unset} B ($([[ -n ${SRAM_L3_SIZE:-} ]] && echo $((SRAM_L3_SIZE/1024)) || echo '?') KB)  | JanS=${JANS_L3_SIZE} B ($((JANS_L3_SIZE/1024)) KB)"
-
-# -------- Sniper runs (only -g overrides; no cfg files; no []) --------
+# -------- Sniper runs --------
 run_sniper() {
   local outdir="$1"; shift
   mkdir -p "$outdir"
   pushd "$RUN_DIR" >/dev/null
-  "$SNIPER_HOME/run-sniper" -c gainestown -n 1 \
+  "$SNIPER_HOME/run-sniper" -c gainestown -n "$SIM_N" \
     -d "$outdir" \
     "$@" \
     -s "$STOP_SPEC" \
-    -- "$BIN" ${ARGS:+$ARGS}
+    -- "${APP_CMD[@]}" \
+    >"$outdir/sniper.log" 2>&1
   local rc=$?
   popd >/dev/null
   return $rc
 }
 
-# Assemble optional energy -g flags if requested
 build_energy_flags() {
   local which="$1"  # "sram" or "jans"
-  if [[ "$ENABLE_LLC_ENERGY" != "1" ]]; then return 0; fi
+  [[ "$ENABLE_LLC_ENERGY" != "1" ]] && return 0
   if [[ "$which" == "sram" ]]; then
     echo -g perf_model/l3_cache/llc/e_read_hit_pJ="$SRAM_E_READ" \
          -g perf_model/l3_cache/llc/e_write_hit_pJ="$SRAM_E_WRITE" \
@@ -226,24 +271,32 @@ build_energy_flags() {
   fi
 }
 
-info "\n==== Sniper: SRAM baseline (${N_M}M instr${WARMUP_M:+, warmup ${WARMUP_M}M}) ===="
+info "\n==== Sniper: SRAM baseline (${N_M}M instr${WARMUP_M:+, warmup ${WARMUP_M}M}, n=${SIM_N}) ===="
+set +e
 timelog_run "sniper_sram" "$TIMINGS_CSV" -- \
   run_sniper "$OUT_SRAM" \
     -g perf_model/l3_cache/cache_size=$(( SRAM_L3_SIZE / 1024 )) \
-    -g perf_model/l3_cache/llc/read_hit_latency_cycles="$SRAM_L3_LAT" \
-    -g perf_model/l3_cache/llc/write_hit_latency_cycles="$SRAM_L3_LAT" \
+    -g perf_model/l3_cache/llc/read_hit_latency_cycles="$SRAM_L3_LAT_RD" \
+    -g perf_model/l3_cache/llc/write_hit_latency_cycles="$SRAM_L3_LAT_WR" \
     $(build_energy_flags sram)
+RC_SRAM=$?
+set -e
+[[ $RC_SRAM -ne 0 ]] && err "Sniper SRAM failed (rc=$RC_SRAM). See $OUT_SRAM/sniper.log"
 
-info "\n==== Sniper: JanS L3 cap approx (${N_M}M instr${WARMUP_M:+, warmup ${WARMUP_M}M}) ===="
+info "\n==== Sniper: JanS L3 cap approx (${N_M}M instr${WARMUP_M:+, warmup ${WARMUP_M}M}, n=${SIM_N}) ===="
+set +e
 timelog_run "sniper_jans" "$TIMINGS_CSV" -- \
   run_sniper "$OUT_JANS" \
     -g perf_model/l3_cache/cache_size=$(( JANS_L3_SIZE / 1024 )) \
     -g perf_model/l3_cache/associativity="${JANS_L3_ASSOC}" \
     -g perf_model/l3_cache/tags_access_time="${L3_TAGS_CYC}" \
     -g perf_model/l3_cache/data_access_time="${JANS_L3_LAT}" \
-    -g perf_model/l3_cache/llc/read_hit_latency_cycles="${JANS_L3_LAT}" \
-    -g perf_model/l3_cache/llc/write_hit_latency_cycles="${JANS_L3_LAT}" \
+    -g perf_model/l3_cache/llc/read_hit_latency_cycles="${JANS_L3_LAT_RD}" \
+    -g perf_model/l3_cache/llc/write_hit_latency_cycles="${JANS_L3_LAT_WR}" \
     $(build_energy_flags jans)
+RC_JANS=$?
+set -e
+[[ $RC_JANS -ne 0 ]] && err "Sniper JanS failed (rc=$RC_JANS). See $OUT_JANS/sniper.log"
 
 # -------- Summaries --------
 info "\n==== Results summary (Sniper) ===="
@@ -263,23 +316,117 @@ summarize() {
   cycles=$(grep -m1 -E "^[[:space:]]*Cycles[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
   ipc=$(grep -m1 -E "^[[:space:]]*IPC[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
   tns=$(grep -m1 -E "^[[:space:]]*Time \(ns\)[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
-  l3acc=$(awk '/Cache L3/{f=1;next} f && /num cache accesses/ {print $NF; f=0}' "$f")
-  l3mis=$(awk '/Cache L3/{f=1;next} f && /num cache misses/   {print $NF; f=0}' "$f")
-  l3mr=$( awk '/Cache L3/{f=1;next} f && /miss rate/          {print $(NF); f=0}' "$f" | tr -d '%')
-  dramacc=$(awk '/DRAM summary/{f=1;next} f && /num dram accesses/ {print $NF; f=0}')
-  # robust numeric grab for dram latency
-  dramlat=$(awk '/DRAM summary/{f=1;next} f && /average dram access latency/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9.]+$/){print $i;break}; f=0}' "$f")
+l3acc=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
 
+l3mis=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache misses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+# Compute miss rate from the sums to avoid per-core "inf%"
+if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
+  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
+else
+  l3mr="NA"
+fi
+
+# DRAM: sum accesses; latency: take the first numeric in the second field
+dramacc=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /num dram accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+dramlat=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /average dram access latency/ {
+    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
+  }' "$f")3acc=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+l3mis=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache misses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+# Compute miss rate from the sums to avoid per-core "inf%"
+if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
+  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
+else
+  l3mr="NA"
+fi
+
+# DRAM: sum accesses; latency: take the first numeric in the second field
+dramacc=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /num dram accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+dramlat=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /average dram access latency/ {
+    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
+  }' "$f")3acc=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+l3mis=$(awk -F'\\|' '
+  /Cache L3/ {f=1; next}
+  f && /num cache misses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+# Compute miss rate from the sums to avoid per-core "inf%"
+if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
+  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
+else
+  l3mr="NA"
+fi
+
+# DRAM: sum accesses; latency: take the first numeric in the second field
+dramacc=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /num dram accesses/ {
+    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+    print sum; exit
+  }' "$f")
+
+dramlat=$(awk -F'\\|' '
+  /DRAM summary/ {f=1; next}
+  f && /average dram access latency/ {
+    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
+  }' "$f")
   printf "%-10s\t%-10s\t%-10s\t%-6s\t%-12s\t%-10s\t%-10s\t%-6s\t%-10s\t%-12s\n" \
     "$tag" "${instr:-NA}" "${cycles:-NA}" "${ipc:-NA}" "${tns:-NA}" \
     "${l3acc:-NA}" "${l3mis:-NA}" "${l3mr:-NA}" "${dramacc:-NA}" "${dramlat:-NA}"
 
-  # Append to CSV (results/summary.csv)
   local csv="$OUT_ROOT/summary.csv"; local ts
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   {
-    if [[ ! -f "$csv" ]]; then echo "timestamp,bench,n_m,config,instructions,cycles,ipc,time_ns,l3_acc,l3_miss,l3_miss_rate_pct,dram_acc,dram_lat_ns,outdir,warmup_m,sram_l3_lat,jans_l3_lat,jans_l3_kb,jans_assoc"; fi
-    echo "$ts,$BENCH,$N_M,$tag,${instr:-},${cycles:-},${ipc:-},${tns:-},${l3acc:-},${l3mis:-},${l3mr:-},${dramacc:-},${dramlat:-},$dir,$WARMUP_M,$SRAM_L3_LAT,$JANS_L3_LAT,$(( JANS_L3_SIZE/1024 )),$JANS_L3_ASSOC"
+    if [[ ! -f "$csv" ]]; then
+      echo "timestamp,bench,n_m,config,instructions,cycles,ipc,time_ns,l3_acc,l3_miss,l3_miss_rate_pct,dram_acc,dram_lat_ns,outdir,warmup_m,sram_l3_lat,jans_l3_lat,jans_l3_kb,jans_assoc,sram_l3_lat_rd,sram_l3_lat_wr,jans_l3_lat_rd,jans_l3_lat_wr"
+    fi
+    echo "$ts,$BENCH,$N_M,$tag,${instr:-},${cycles:-},${ipc:-},${tns:-},${l3acc:-},${l3mis:-},${l3mr:-},${dramacc:-},${dramlat:-},$dir,$WARMUP_M,$SRAM_L3_LAT,$JANS_L3_LAT,$(( JANS_L3_SIZE/1024 )),$JANS_L3_ASSOC,$SRAM_L3_LAT_RD,$SRAM_L3_LAT_WR,$JANS_L3_LAT_RD,$JANS_L3_LAT_WR"
   } >> "$csv"
 }
 
@@ -288,9 +435,6 @@ summarize "SRAM" "$OUT_SRAM"
 summarize "JanS" "$OUT_JANS"
 
 # -------- Energy / ED^2P (bounds) --------
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python3 "$REPO_ROOT/scripts/energy_ed2p.py" "$OUT_SRAM/sim.out" "$OUT_JANS/sim.out" -o "$OUT_ROOT/energy.csv" || echo "[WARN] Energy/ED^2P calculation failed"
 
 echo
 ok "Done."
-

@@ -58,15 +58,19 @@ def infer_bench_root_from_run_dir(run_dir: str) -> str:
 
 def extract_bench_name_and_nm(run_dir: str) -> Tuple[str, Optional[str]]:
     """
-    Infer human-readable benchmark name and ROI N_M (e.g., '100') from a run dir.
-    Name is the base after stripping _sram/_jans/_<N>M, same as infer_bench_root_from_run_dir.
-    Returns (bench_name, n_m_str or None)
+    From a run dir like:
+      results/541_leela_r_sram_100M  -> ("541_leela_r", "100")
+      results/520_omnetpp_r_JanS_cap_approx_100M -> ("520_omnetpp_r", "100")
     """
-    base = os.path.basename(infer_bench_root_from_run_dir(run_dir))
-    m = re.search(r'_(\d+)M$', os.path.basename(run_dir))
+    leaf = os.path.basename(run_dir)
+    # strip _sram*, _jans* (case-insensitive)
+    bench = re.sub(r'_(sram|jans)[^/]*', '', leaf, flags=re.IGNORECASE)
+    # capture trailing _<N>M
+    m = re.search(r'_(\d+)M$', leaf)
     n_m = m.group(1) if m else None
-    # For SPEC-like names, you may want dotted form ('520.omnetpp_r'); leave as underscored for consistency with your results.
-    return base, n_m
+    # strip the trailing _<N>M from bench name
+    bench = re.sub(r'_\d+M$', '', bench)
+    return bench, n_m
 
 # =========================
 # Parsing helpers
@@ -189,7 +193,7 @@ def main():
     jans_dir = os.path.dirname(jans_simout)
 
     # Output directory under results/<bench>/
-    out_dir = infer_bench_root_from_run_dir(sram_dir)
+    out_dir = os.path.dirname(sram_dir)
     ensure_dir(out_dir)
 
     # Infer name + ROI for summary rows
@@ -284,4 +288,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
