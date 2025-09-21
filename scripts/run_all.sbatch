@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=72:00:00
-#SBATCH --array=0-3
+#SBATCH --array=0-11
 #SBATCH --output=%x-%A_%a.out
 #SBATCH --error=%x-%A_%a.err
 
@@ -53,6 +53,9 @@ JANS_E_MISS="${JANS_E_MISS:-77}";   JANS_P_LEAK="${JANS_P_LEAK:-48}"
 SPEC_SIZE="${SPEC_SIZE:-test}"      # test | train | ref
 BUILD_IF_NEEDED="${BUILD_IF_NEEDED:-1}"
 
+# New: allow skipping the DynamoRIO memtrace stage
+SKIP_TRACE="${SKIP_TRACE:-0}"       # 1 = skip trace, 0 = run trace
+
 # Export knobs used by the pipeline
 export WARMUP_M SRAM_L3_LAT SRAM_L3_SIZE L3_TAGS_CYC
 export JANS_L3_SIZE JANS_L3_ASSOC JANS_L3_LAT
@@ -60,29 +63,40 @@ export ENABLE_LLC_ENERGY SRAM_E_READ SRAM_E_WRITE SRAM_E_MISS SRAM_P_LEAK
 export JANS_E_READ JANS_E_WRITE JANS_E_MISS JANS_P_LEAK
 export SIM_N SPEC_SIZE
 
-# NEW: export asymmetric envs
-export SRAM_L3_LAT_RD SRAM_L3_LAT_WR JANS_L3_LAT_RD JANS_L3_LAT_WR
+# Make OpenMP threads follow your core count (affects *_s benches)
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
 
 chmod +x scripts/run_spec_pipeline.sh
+
+# Build optional CLI for skip-trace
+TRACE_ARGS=()
+if [[ "$SKIP_TRACE" == "1" ]]; then
+  TRACE_ARGS+=(--skip-trace)
+fi
 
 if [[ -n "$CMD" ]]; then
   # ======================== CMD MODE ========================
   echo ">>> [CMD MODE] LABEL=$LABEL | ROI=${ROI}M, WARMUP_M=${WARMUP_M}M, SIM_N=${SIM_N}, CWD=$CWD"
   echo ">>> CMD: $CMD"
   echo ">>> JanS: size=$((JANS_L3_SIZE/1024))KB assoc=${JANS_L3_ASSOC} read=${JANS_L3_LAT_RD}c write=${JANS_L3_LAT_WR}c, tags=${L3_TAGS_CYC}"
-  echo ">>> SRAM: size=$((SRAM_L3_SIZE/1024))KB read=${SRAM_L3_LAT_RD}c write=${SRAM_L3_LAT_WR}c"
+  echo ">>> SRAM: size=$((SRAM_L3_SIZE/1024))KB read=${SRAM_L3_LAT_RD}c write=${SRAM_L3_LAT_WR}c  |  skip_trace=${SKIP_TRACE}"
 
   scripts/run_spec_pipeline.sh \
     --bench "$LABEL" \
     --n-m "$ROI" \
     --cmd "$CMD" \
     --cwd "$CWD" \
-    --sim-n "$SIM_N"
+    --sim-n "$SIM_N" \
+    "${TRACE_ARGS[@]}"
 
   echo ">>> Done ${LABEL}"
 else
   # ======================== SPEC MODE ========================
-  BENCHES=( "541.leela_r" "531.deepsjeng_r" "520.omnetpp_r" "648.exchange2_s" )
+  BENCHES=(
+    "541.leela_r" "531.deepsjeng_r" "520.omnetpp_r" "648.exchange2_s"
+    "505.mcf_r" "523.xalancbmk_r" "500.perlbench_r" "502.gcc_r"
+    "557.xz_r" "619.lbm_s" "621.wrf_s" "649.fotonik3d_s"
+  )
 
   if [[ ${SLURM_ARRAY_TASK_ID:-0} -ge ${#BENCHES[@]} ]]; then
     echo "[ERR] SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset} out of range"
@@ -92,13 +106,14 @@ else
 
   echo ">>> [SPEC MODE] Running ${BENCH} | ROI=${ROI}M, WARMUP_M=${WARMUP_M}M, SPEC_SIZE=${SPEC_SIZE} on $(hostname)"
   echo ">>> JanS: size=$((JANS_L3_SIZE/1024))KB assoc=${JANS_L3_ASSOC} read=${JANS_L3_LAT_RD}c write=${JANS_L3_LAT_WR}c, tags=${L3_TAGS_CYC}"
-  echo ">>> SRAM: size=$((SRAM_L3_SIZE/1024))KB read=${SRAM_L3_LAT_RD}c write=${SRAM_L3_LAT_WR}c  |  LLC energy flags: ${ENABLE_LLC_ENERGY}"
+  echo ">>> SRAM: size=$((SRAM_L3_SIZE/1024))KB read=${SRAM_L3_LAT_RD}c write=${SRAM_L3_LAT_WR}c  |  LLC energy flags: ${ENABLE_LLC_ENERGY}  |  skip_trace=${SKIP_TRACE}"
 
   scripts/run_spec_pipeline.sh \
     --bench "$BENCH" \
     --n-m "$ROI" \
     --build-if-needed \
-    --spec-size "$SPEC_SIZE"
+    --spec-size "$SPEC_SIZE" \
+    "${TRACE_ARGS[@]}"
 
   echo ">>> Done ${BENCH}"
 fi

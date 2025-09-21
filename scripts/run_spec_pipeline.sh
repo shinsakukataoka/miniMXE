@@ -16,6 +16,7 @@ FEATURES_M="${FEATURES_M:-10}"
 BUILD_IF_NEEDED=0
 SIM_N="${SIM_N:-1}"
 SPEC_SIZE="${SPEC_SIZE:-test}"   # test | train | ref
+SKIP_TRACE="${SKIP_TRACE:-0}"    # 1 = skip DynamoRIO memtrace stage
 
 # SRAM baseline knobs (size-aware)
 SRAM_L3_SIZE="${SRAM_L3_SIZE:-$((8192*1024))}"   # bytes; convert to KB
@@ -81,11 +82,12 @@ while [[ $# -gt 0 ]]; do
     --cwd) CWD="$2"; shift 2;;
     --sim-n) SIM_N="$2"; shift 2;;
     --spec-size) SPEC_SIZE="$2"; shift 2;;
+    --skip-trace) SKIP_TRACE=1; shift;;
     *) echo "[ERR] Unknown arg: $1"; exit 1;;
   esac
 done
 
-[[ -z "$BENCH" || -z "$N_M" ]] && { echo "Usage: $0 --bench <LABEL|SPEC_BENCH> --n-m <N_MILLION> [--cmd <full command>] [--cwd <dir>] [--sim-n <cores>] [--build-if-needed] [opts...]"; exit 1; }
+[[ -z "$BENCH" || -z "$N_M" ]] && { echo "Usage: $0 --bench <LABEL|SPEC_BENCH> --n-m <N_MILLION> [--cmd <full command>] [--cwd <dir>] [--sim-n <cores>] [--build-if-needed] [--skip-trace] [opts...]"; exit 1; }
 
 info(){ echo -e "$*"; }
 ok(){   echo -e "\e[32m[OK]\e[0m $*"; }
@@ -127,7 +129,6 @@ timelog_run(){  # timelog_run <label> <csv> -- <cmd...>
 
 # -------- Sanity --------
 info "\n==== Sanity checks ===="
-"$DR_HOME/bin64/drrun" -version >/dev/null && ok "DynamoRIO OK" || { err "DynamoRIO not found"; exit 1; }
 if [[ -z "$CMD" ]]; then
   if [[ -f "$SPEC_ROOT/shrc" ]]; then
     pushd "$SPEC_ROOT" >/dev/null; . ./shrc; popd >/dev/null
@@ -136,6 +137,12 @@ if [[ -z "$CMD" ]]; then
   fi
   command -v runcpu >/dev/null && ok "SPEC runcpu OK" || { err "SPEC runcpu missing"; exit 1; }
 fi
+if [[ "$SKIP_TRACE" != "1" ]]; then
+  "$DR_HOME/bin64/drrun" -version >/dev/null && ok "DynamoRIO OK" || { err "DynamoRIO not found"; exit 1; }
+else
+  ok "Skipping DynamoRIO checks (--skip-trace)"
+fi
+
 if ldd "$SNIPER_HOME/lib/sniper" 2>/dev/null | grep -qi sqlite; then
   ok "sqlite visible to Sniper"
 else
@@ -211,33 +218,37 @@ timelog_run "native" "$TIMINGS_CSV" -- "${APP_CMD[@]}" || true
 popd >/dev/null
 
 # -------- DynamoRIO trace + features --------
-info "\n==== DynamoRIO (${TRACE_SEC}s text trace) + features ===="
-pushd "$RUN_DIR" >/dev/null
-set +e
-timelog_run "drrun_memtrace_${TRACE_SEC}s" "$TIMINGS_CSV" -- \
-  "$DR_HOME/bin64/drrun" -root "$DR_HOME" -follow_children -c "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" -- \
-  /usr/bin/timeout "${TRACE_SEC}s" "${APP_CMD[@]}"
-RC=$?
-set -e
-if   [[ $RC -eq 124 ]]; then ok "Trace stopped at timeout (rc=124)"
-elif [[ $RC -eq 0   ]]; then ok "Trace completed before timeout"
-else err "DynamoRIO run failed (rc=$RC)"; popd >/dev/null; exit $RC; fi
+if [[ "$SKIP_TRACE" != "1" ]]; then
+  info "\n==== DynamoRIO (${TRACE_SEC}s text trace) + features ===="
+  pushd "$RUN_DIR" >/dev/null
+  set +e
+  timelog_run "drrun_memtrace_${TRACE_SEC}s" "$TIMINGS_CSV" -- \
+    "$DR_HOME/bin64/drrun" -root "$DR_HOME" -follow_children -c "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" -- \
+    /usr/bin/timeout "${TRACE_SEC}s" "${APP_CMD[@]}"
+  RC=$?
+  set -e
+  if   [[ $RC -eq 124 ]]; then ok "Trace stopped at timeout (rc=124)"
+  elif [[ $RC -eq 0   ]]; then ok "Trace completed before timeout"
+  else err "DynamoRIO run failed (rc=$RC)"; popd >/dev/null; exit $RC; fi
 
-# Find trace file robustly: look in DR samples dir and CWD; prefer one matching APP, else newest
-TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*"$APP"*.log "$RUN_DIR"/memtrace.*"$APP"*.log 2>/dev/null | head -1 || true)"
-if [[ -z "${TRACEFILE:-}" ]]; then
-  TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*.log "$RUN_DIR"/memtrace.*.log 2>/dev/null | head -1 || true)"
-fi
-if [[ -z "${TRACEFILE:-}" || ! -f "$TRACEFILE" ]]; then
-  warn "No memtrace log found for $APP in either $DR_HOME/samples/bin64 or $RUN_DIR"
+  # Find trace file robustly: look in DR samples dir and CWD; prefer one matching APP, else newest
+  TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*"$APP"*.log "$RUN_DIR"/memtrace.*"$APP"*.log 2>/dev/null | head -1 || true)"
+  if [[ -z "${TRACEFILE:-}" ]]; then
+    TRACEFILE="$(ls -t "$DR_HOME"/samples/bin64/memtrace.*.log "$RUN_DIR"/memtrace.*.log 2>/dev/null | head -1 || true)"
+  fi
+  if [[ -z "${TRACEFILE:-}" || ! -f "$TRACEFILE" ]]; then
+    warn "No memtrace log found for $APP in either $DR_HOME/samples/bin64 or $RUN_DIR"
+  else
+    ok "Using trace: $TRACEFILE"
+    mkdir -p "$OUT_ROOT/traces"
+    cp -p "$TRACEFILE" "$OUT_ROOT/traces/"
+    python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$FEATURES_CSV" --M "$FEATURES_M" "$TRACEFILE" \
+      || warn "Feature extraction failed (continuing)"
+  fi
+  popd >/dev/null
 else
-  ok "Using trace: $TRACEFILE"
-  mkdir -p "$OUT_ROOT/traces"
-  cp -p "$TRACEFILE" "$OUT_ROOT/traces/"
-  python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$FEATURES_CSV" --M "$FEATURES_M" "$TRACEFILE" \
-    || warn "Feature extraction failed (continuing)"
+  info "\n==== Skipping DynamoRIO trace (--skip-trace) ===="
 fi
-popd >/dev/null
 
 # -------- Sniper runs --------
 run_sniper() {
@@ -298,7 +309,7 @@ RC_JANS=$?
 set -e
 [[ $RC_JANS -ne 0 ]] && err "Sniper JanS failed (rc=$RC_JANS). See $OUT_JANS/sniper.log"
 
-# -------- Summaries --------
+# -------- Results summary --------
 info "\n==== Results summary (Sniper) ===="
 summary_header() {
   printf "%-10s\t%-10s\t%-10s\t%-6s\t%-12s\t%-10s\t%-10s\t%-6s\t%-10s\t%-12s\n" \
@@ -311,111 +322,46 @@ summarize() {
     printf "%-10s\t%-10s\t%-10s\t%-6s\t%-12s\t%-10s\t%-10s\t%-6s\t%-10s\t%-12s\n" \
       "$tag" "MISSING" "-" "-" "-" "-" "-" "-" "-" "-"; return
   fi
+
   local instr cycles ipc tns l3acc l3mis l3mr dramacc dramlat
   instr=$(grep -m1 -E "^[[:space:]]*Instructions[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
   cycles=$(grep -m1 -E "^[[:space:]]*Cycles[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
   ipc=$(grep -m1 -E "^[[:space:]]*IPC[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
   tns=$(grep -m1 -E "^[[:space:]]*Time \(ns\)[[:space:]]*\|" "$f" | awk -F'|' '{gsub(/[ \t]/,"",$2); print $2}')
-l3acc=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
 
-l3mis=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache misses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
+  l3acc=$(awk -F'\\|' '
+    /Cache L3/ {f=1; next}
+    f && /num cache accesses/ {
+      sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+      print sum; exit
+    }' "$f")
 
-# Compute miss rate from the sums to avoid per-core "inf%"
-if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
-  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
-else
-  l3mr="NA"
-fi
+  l3mis=$(awk -F'\\|' '
+    /Cache L3/ {f=1; next}
+    f && /num cache misses/ {
+      sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+      print sum; exit
+    }' "$f")
 
-# DRAM: sum accesses; latency: take the first numeric in the second field
-dramacc=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /num dram accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
+  if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
+    l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
+  else
+    l3mr="NA"
+  fi
 
-dramlat=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /average dram access latency/ {
-    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
-  }' "$f")3acc=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
+  dramacc=$(awk -F'\\|' '
+    /DRAM summary/ {f=1; next}
+    f && /num dram accesses/ {
+      sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
+      print sum; exit
+    }' "$f")
 
-l3mis=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache misses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
+  dramlat=$(awk -F'\\|' '
+    /DRAM summary/ {f=1; next}
+    f && /average dram access latency/ {
+      g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
+    }' "$f")
 
-# Compute miss rate from the sums to avoid per-core "inf%"
-if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
-  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
-else
-  l3mr="NA"
-fi
-
-# DRAM: sum accesses; latency: take the first numeric in the second field
-dramacc=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /num dram accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
-
-dramlat=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /average dram access latency/ {
-    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
-  }' "$f")3acc=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
-
-l3mis=$(awk -F'\\|' '
-  /Cache L3/ {f=1; next}
-  f && /num cache misses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
-
-# Compute miss rate from the sums to avoid per-core "inf%"
-if [[ -n "${l3acc:-}" && -n "${l3mis:-}" && "$l3acc" -gt 0 ]]; then
-  l3mr=$(awk -v a="$l3acc" -v m="$l3mis" 'BEGIN{printf "%.2f", 100*m/a}')
-else
-  l3mr="NA"
-fi
-
-# DRAM: sum accesses; latency: take the first numeric in the second field
-dramacc=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /num dram accesses/ {
-    sum=0; for(i=2;i<=NF;i++){g=$i; gsub(/[^0-9]/,"",g); if(length(g)) sum+=g}
-    print sum; exit
-  }' "$f")
-
-dramlat=$(awk -F'\\|' '
-  /DRAM summary/ {f=1; next}
-  f && /average dram access latency/ {
-    g=$2; gsub(/[[:space:]]/,"",g); sub(/[^0-9.].*/,"",g); print g; exit
-  }' "$f")
   printf "%-10s\t%-10s\t%-10s\t%-6s\t%-12s\t%-10s\t%-10s\t%-6s\t%-10s\t%-12s\n" \
     "$tag" "${instr:-NA}" "${cycles:-NA}" "${ipc:-NA}" "${tns:-NA}" \
     "${l3acc:-NA}" "${l3mis:-NA}" "${l3mr:-NA}" "${dramacc:-NA}" "${dramlat:-NA}"
@@ -434,7 +380,6 @@ summary_header
 summarize "SRAM" "$OUT_SRAM"
 summarize "JanS" "$OUT_JANS"
 
-# -------- Energy / ED^2P (bounds) --------
-
 echo
 ok "Done."
+
