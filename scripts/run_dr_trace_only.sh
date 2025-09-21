@@ -10,14 +10,15 @@ GCC_DIR="${GCC_DIR:-/cm/local/apps/gcc/13.1.0}"
 CONDA_SQLITE_LIB="${CONDA_SQLITE_LIB:-$HOME/miniconda3/lib}"
 TMPDIR="${TMPDIR:-$HOME/tmp}"
 OUT_ROOT="${OUT_ROOT:-$PWD/results_trace}"
-FEATURES_CSV="${FEATURES_CSV:-$OUT_ROOT/features_${SLURM_JOB_ID:-$$}.csv}"   # aggregated per job run
-TRACE_SEC="${TRACE_SEC:-4}"
+FEATURES_CSV="${FEATURES_CSV:-$OUT_ROOT/features_${SLURM_JOB_ID:-$$}.csv}"
+TRACE_SEC="${TRACE_SEC:-10}"
 FEATURES_M="${FEATURES_M:-10}"
 BUILD_IF_NEEDED=0
 COMPRESS_TRACE="${COMPRESS_TRACE:-1}"
 DR_DEBUG="${DR_DEBUG:-0}"
+SPEC_SIZE="${SPEC_SIZE:-test}"
 
-# -------- Args --------
+# -------- Arg parse --------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bench) BENCH="$2"; shift 2;;
@@ -34,7 +35,6 @@ while [[ $# -gt 0 ]]; do
     *) echo "[ERR] Unknown arg: $1" >&2; exit 1;;
   esac
 done
-
 [[ -z "$BENCH" ]] && { echo "Usage: $0 --bench <SPEC_BENCH> [opts...]"; exit 1; }
 
 # -------- Logging helpers --------
@@ -51,35 +51,20 @@ mkdir -p "$OUT_ROOT" "$OUT_ROOT/traces" "$TMPDIR"
 SHORT="${BENCH//./_}"
 TIMINGS_CSV="$OUT_ROOT/timings.csv"
 
-# --- tiny helper to time any command and append to results/timings.csv ---
-timelog_run(){  # timelog_run <label> <csv> -- <cmd...>
-  local label="$1"; shift
-  local of="$1"; shift
-  [[ "${1:-}" == "--" ]] && shift || true
-  local start end dur rc ts
-  start=$(date +%s.%N)
-  "$@" >/dev/null 2>&1
-  rc=$?
-  end=$(date +%s.%N)
-  dur=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", (e-s)}')
-  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  { [[ -f "$of" ]] || echo "timestamp,bench,label,seconds,rc"; echo "$ts,$BENCH,$label,$dur,$rc"; } >> "$of"
-  return $rc
-}
+# Unique RAW dir; symlink the client here so logs land *in this dir*
+RAW_ID="${SLURM_ARRAY_TASK_ID:-$PPID}"
+RAW_DIR="$OUT_ROOT/traces/raw.${RAW_ID}.${SHORT}"
+mkdir -p "$RAW_DIR"
+ln -sf "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" "$RAW_DIR/libmemtrace_x86_text.so"
+info "[INFO] DR memtrace RAW dir: $RAW_DIR"
 
 # -------- Sanity --------
 info "\n==== Sanity checks ===="
 "$DR_HOME/bin64/drrun" -version >/dev/null && ok "DynamoRIO OK" || { err "DynamoRIO not found at $DR_HOME"; exit 1; }
 command -v timeout >/dev/null && ok "coreutils timeout OK" || { err "'timeout' not found"; exit 1; }
 
-if [[ -f "$SPEC_ROOT/shrc" ]]; then
-  pushd "$SPEC_ROOT" >/dev/null
-  . ./shrc
-  popd >/dev/null
-else
-  err "SPEC shrc not found at $SPEC_ROOT/shrc"
-  exit 1
-fi
+if [[ -f "$SPEC_ROOT/shrc" ]]; then pushd "$SPEC_ROOT" >/dev/null; . ./shrc; popd >/dev/null
+else err "SPEC shrc not found at $SPEC_ROOT/shrc"; exit 1; fi
 command -v runcpu >/dev/null && ok "SPEC runcpu OK" || { err "SPEC runcpu missing"; exit 1; }
 
 # -------- Locate/build run dir --------
@@ -89,12 +74,11 @@ RUN_ROOT="$BENCH_DIR/run"
 if [[ ! -d "$RUN_ROOT" ]] || ! ls -dt "$RUN_ROOT"/run_* >/dev/null 2>&1; then
   if [[ $BUILD_IF_NEEDED -eq 1 ]]; then
     pushd "$SPEC_ROOT" >/dev/null
-    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size test --action build "$BENCH"
-    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size test --action run   "$BENCH"
+    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size "$SPEC_SIZE" --action build "$BENCH"
+    runcpu --config my-gcc.cfg --define gcc_dir="$GCC_DIR" --tune base --size "$SPEC_SIZE" --action run   "$BENCH"
     popd >/dev/null
   else
-    err "No run_* dir and --build-if-needed not set"
-    exit 1
+    err "No run_* dir and --build-if-needed not set"; exit 1
   fi
 fi
 
@@ -120,9 +104,7 @@ fi
 if [[ -z "${ARGS:-}" ]]; then
   case "$BENCH" in
     648.exchange2_s) ARGS="2" ;;
-    505.mcf_r)
-      [[ -f "$RUN_DIR/inp.in" ]] && ARGS="inp.in"
-      ;;
+    505.mcf_r) [[ -f "$RUN_DIR/inp.in" ]] && ARGS="inp.in" ;;
     557.xz_r)
       xz_in=$(ls -1 "$RUN_DIR"/*.xz 2>/dev/null | head -1 || true)
       [[ -n "$xz_in" ]] && ARGS="-dkc $(basename "$xz_in")"
@@ -138,7 +120,11 @@ ok "Args    : ${ARGS:-<none>}"
 # -------- Optional native timing (no tools) --------
 info "\n==== Native timing (no tools) ===="
 pushd "$RUN_DIR" >/dev/null
-timelog_run "native" "$TIMINGS_CSV" -- "$BIN" ${ARGS:+$ARGS} || true
+# append timing row (simple)
+start=$(date +%s.%N); ( "$BIN" ${ARGS:+$ARGS} ) >/dev/null 2>&1 || true; end=$(date +%s.%N)
+dur=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", (e-s)}')
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+{ [[ -f "$TIMINGS_CSV" ]] || echo "timestamp,bench,label,seconds,rc"; echo "$ts,$BENCH,native,$dur,0"; } >> "$TIMINGS_CSV"
 popd >/dev/null
 
 # -------- DynamoRIO trace + features --------
@@ -146,95 +132,64 @@ info "\n==== DynamoRIO (${TRACE_SEC}s text trace) + features ===="
 pushd "$RUN_DIR" >/dev/null
 
 MARKER="$(mktemp "$TMPDIR/memtrace.marker.XXXX")"; touch "$MARKER"
-trap 'rm -f "$MARKER" >/dev/null 2>&1 || true' EXIT
-
 DATE_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
 DRR_LOG="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.drrun.stderr.log"
 
-set +e
-timelog_run "drrun_memtrace_${TRACE_SEC}s" "$TIMINGS_CSV" -- \
-  "$DR_HOME/bin64/drrun" ${DR_DEBUG:+-debug -verbose 2} \
+# run drrun wrapping timeout, client loaded from RAW_DIR
+start=$(date +%s.%N)
+"$DR_HOME/bin64/drrun" ${DR_DEBUG:+-debug -verbose 2} \
   -root "$DR_HOME" -follow_children \
-  -c "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" -- \
+  -c "$RAW_DIR/libmemtrace_x86_text.so" -- \
   /usr/bin/timeout "${TRACE_SEC}s" "$BIN" ${ARGS:+$ARGS} \
-  2>"$DRR_LOG"
-RC=$?
-set -e
+  1>"$RAW_DIR/runner.stdout.log" 2>"$DRR_LOG" || RC=$?
+end=$(date +%s.%N)
+dur=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", (e-s)}')
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+{ [[ -f "$TIMINGS_CSV" ]] || echo "timestamp,bench,label,seconds,rc";
+  echo "$ts,$BENCH,drrun_memtrace_${TRACE_SEC}s,$dur,${RC:-0}"; } >> "$TIMINGS_CSV"
 
-if   [[ $RC -eq 124 ]]; then ok "Trace reached timeout (rc=124)"
-elif [[ $RC -eq 0   ]]; then ok "Trace completed before timeout"
-else warn "drrun returned rc=$RC (continuing; will look for a trace). See $(basename "$DRR_LOG")"
-fi
-
+# harvest strictly from RAW_DIR; prefer app-matched
 APP="$(basename "$BIN")"
-
-# Search order: RUN_DIR (default), OUT_ROOT/traces, DR_HOME/samples/bin64
-TRACE_CANDS=()
-
-mapfile -t TRACE_CANDS < <(
-  find "$RUN_DIR" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*${APP}*.log" 2>/dev/null | xargs -r ls -1t 2>/dev/null
-)
-if [[ ${#TRACE_CANDS[@]} -eq 0 ]]; then
-  mapfile -t TRACE_CANDS < <(
-    find "$OUT_ROOT/traces" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*${APP}*.log" 2>/dev/null | xargs -r ls -1t 2>/dev/null
-  )
-fi
-if [[ ${#TRACE_CANDS[@]} -eq 0 ]]; then
-  mapfile -t TRACE_CANDS < <(
-    find "$DR_HOME/samples/bin64" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*${APP}*.log" 2>/dev/null | xargs -r ls -1t 2>/dev/null
-  )
-fi
-# Extra wildcard fallback (some builds don’t include the exe name in the file)
-if [[ ${#TRACE_CANDS[@]} -eq 0 ]]; then
-  mapfile -t TRACE_CANDS < <(
-    { find "$RUN_DIR" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*.log" 2>/dev/null;
-      find "$OUT_ROOT/traces" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*.log" 2>/dev/null;
-      find "$DR_HOME/samples/bin64" -maxdepth 1 -type f -newer "$MARKER" -name "memtrace.*.log" 2>/dev/null; } \
-    | xargs -r ls -1t 2>/dev/null
-  )
-fi
-# last-chance without -newer (odd FS mtimes)
-if [[ ${#TRACE_CANDS[@]} -eq 0 ]]; then
-  mapfile -t TRACE_CANDS < <(
-    ls -1t "$RUN_DIR"/memtrace.*.log "$OUT_ROOT"/traces/memtrace.*.log "$DR_HOME"/samples/bin64/memtrace.*.log 2>/dev/null || true
-  )
+TRACE_SRC=""
+if ls "$RAW_DIR"/memtrace.*"$APP"*.log >/dev/null 2>&1; then
+  TRACE_SRC="$(ls -t "$RAW_DIR"/memtrace.*"$APP"*.log | head -1)"
+elif ls "$RAW_DIR"/memtrace.*.log >/dev/null 2>&1; then
+  TRACE_SRC="$(ls -t "$RAW_DIR"/memtrace.*.log | head -1)"
 fi
 
-if [[ ${#TRACE_CANDS[@]} -eq 0 ]]; then
-  err "No memtrace log found for ${APP} after run. See $(basename "$DRR_LOG") for details."
-  popd >/dev/null
-  exit 2
+if [[ -z "${TRACE_SRC:-}" || ! -f "$TRACE_SRC" ]]; then
+  err "No memtrace log found in $RAW_DIR. See $(basename "$DRR_LOG")"; popd >/dev/null; exit 2
 fi
 
-TRACE_SRC="${TRACE_CANDS[0]}"
 TRACE_DST="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.log"
-cp -p "$TRACE_SRC" "$TRACE_DST" && rm -f "$TRACE_SRC"
+info "[INFO] Trace src: $TRACE_SRC"
+cp -p "$TRACE_SRC" "$TRACE_DST"
 ok "Trace saved: $TRACE_DST"
 
-
-
-# Features (aggregated CSV per job). Serialize with flock if available.
+# ---- Features: compute then append under a short lock ----
 if [[ -f "$DR_HOME/samples/mem_metrics_v3.py" ]]; then
-  if command -v flock >/dev/null 2>&1; then
-    flock -w 120 "$FEATURES_CSV.lock" \
-      python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$FEATURES_CSV" --M "$FEATURES_M" "$TRACE_DST"
+  TMP_FEATURES="$OUT_ROOT/features.tmp.${DATE_TAG}_${SHORT}.csv"
+  python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$TMP_FEATURES" --M "$FEATURES_M" "$TRACE_DST"
+
+  # short critical section to append
+  exec 9>"$FEATURES_CSV.lock"
+  flock 9
+  if [[ ! -f "$FEATURES_CSV" ]]; then
+    cp "$TMP_FEATURES" "$FEATURES_CSV"
   else
-    python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$FEATURES_CSV" --M "$FEATURES_M" "$TRACE_DST"
+    tail -n +2 "$TMP_FEATURES" >> "$FEATURES_CSV"
   fi
+  flock -u 9
+  exec 9>&-
+  rm -f "$TMP_FEATURES"
   ok "Features written to: $FEATURES_CSV"
 else
   warn "mem_metrics_v3.py not found at $DR_HOME/samples/mem_metrics_v3.py; skipping features"
 fi
 
-# Optional: compress the text trace
+# Optional: compress after features
 if [[ "$COMPRESS_TRACE" == "1" ]]; then
-  if command -v gzip >/dev/null 2>&1; then
-    gzip -f "$TRACE_DST"
-    TRACE_DST="${TRACE_DST}.gz"
-    ok "Compressed trace: $TRACE_DST"
-  else
-    warn "gzip not found; leaving trace uncompressed"
-  fi
+  if command -v gzip >/dev/null 2>&1; then gzip -f "$TRACE_DST"; TRACE_DST="${TRACE_DST}.gz"; ok "Compressed trace: $TRACE_DST"; fi
 fi
 
 popd >/dev/null
@@ -245,6 +200,7 @@ echo "Bench        : $BENCH"
 echo "Run dir      : $RUN_DIR"
 echo "Binary       : $BIN"
 echo "Args         : ${ARGS:-<none>}"
+echo "Trace src    : $TRACE_SRC"
 echo "Trace file   : $TRACE_DST"
 echo "Timings CSV  : $TIMINGS_CSV"
 echo "Features CSV : $FEATURES_CSV"
