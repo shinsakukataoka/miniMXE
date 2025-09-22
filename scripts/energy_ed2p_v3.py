@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Compute LLC-only energy/ED^2P for SRAM vs JanS.
+Compute LLC-only energy/ED^2P for SRAM vs JanS (or any "tech" run in the JanS slot).
 
+What this script does:
 - Reads timing + coarse L3 stats from each run's sim.out
 - Reads exact L3 hit/miss breakdown from sim.stats.sqlite3
+- NEW: Reads LLC energy constants (pJ/mW) from each run's sim.cfg if present
 - Writes CSVs into: <OUT_ROOT>/output_<bench>/
     * energy_bounds.csv   (includes exact energy + bounds)
     * summary.csv         (text + sqlite stats side-by-side + avg L3 hit ns)
@@ -13,7 +15,12 @@ Usage:
 
 Notes:
   * Energy scope is LLC-only (nJ/event + W leakage).
-  * DRAM latency from sim.out is recorded as value + unit (no conversion).
+  * If a run's sim.cfg includes:
+       perf_model/l3_cache/llc/e_read_hit_pJ
+       perf_model/l3_cache/llc/e_write_hit_pJ
+       perf_model/l3_cache/llc/e_miss_pJ
+       perf_model/l3_cache/llc/p_leak_mW
+     those are parsed and used (converted to nJ/W). Otherwise we fall back to defaults.
 """
 
 import argparse
@@ -24,10 +31,10 @@ import sqlite3
 from datetime import datetime, timezone
 
 # =========================
-# Constants (LLC model)
+# Defaults (fallback if sim.cfg has no overrides)
 # =========================
-SRAM = dict(E_hit_nJ=0.565, E_miss_nJ=0.011, E_write_nJ=0.537, P_leak_W=3.438)
-JANS = dict(E_hit_nJ=0.188, E_miss_nJ=0.077, E_write_nJ=2.305, P_leak_W=0.048)
+SRAM_DEFAULT = dict(E_hit_nJ=0.565, E_miss_nJ=0.011, E_write_nJ=0.537, P_leak_W=3.438)
+JANS_DEFAULT = dict(E_hit_nJ=0.188, E_miss_nJ=0.077, E_write_nJ=2.305, P_leak_W=0.048)
 
 # =========================
 # Filesystem helpers
@@ -194,19 +201,20 @@ def read_llc_latency_from_db(run_dir):
         return {}
     with sqlite3.connect(db) as conn:
         cur = conn.cursor()
+
+        # Use total() so large counters don't overflow 64-bit SUM()
         def one(metricname):
-            sql = """
-                SELECT IFNULL(SUM(v.value),0)
+            cur.execute("""
+                SELECT COALESCE(total(v.value), 0.0)
                 FROM "values" v
                 JOIN names    n ON v.nameid   = n.nameid
                 JOIN prefixes p ON v.prefixid = p.prefixid
                 WHERE p.prefixname = ?
                   AND n.objectname = 'L3'
                   AND n.metricname = ?;
-            """
-            cur.execute(sql, ("roi-end", metricname))
+            """, ("roi-end", metricname))
             row = cur.fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
+            return float(row[0]) if row and row[0] is not None else 0.0
 
         lat = {
             "l3_total_latency_ns":  one("total-latency"),
@@ -215,8 +223,9 @@ def read_llc_latency_from_db(run_dir):
             "l3_qbs_latency_ns":    one("qbs-query-latency"),
         }
 
+        # Sum all uncore-time-* safely (again, use total())
         cur.execute("""
-            SELECT n.metricname, IFNULL(SUM(v.value),0)
+            SELECT n.metricname, COALESCE(total(v.value), 0.0)
             FROM "values" v
             JOIN names    n ON v.nameid   = n.nameid
             JOIN prefixes p ON v.prefixid = p.prefixid
@@ -226,8 +235,10 @@ def read_llc_latency_from_db(run_dir):
             GROUP BY n.metricname;
         """, ("roi-end",))
         rows = cur.fetchall()
-        lat["l3_uncore_time_sum_ns"] = int(sum(val for _, val in rows)) if rows else 0
+        lat["l3_uncore_time_sum_ns"] = float(sum(val for _, val in rows)) if rows else 0.0
+
     return lat
+
 
 def read_uncore_requests(run_dir):
     db = os.path.join(run_dir, "sim.stats.sqlite3")
@@ -305,8 +316,69 @@ def period_ns_from_parsed(parsed):
         return None
 
 # =========================
-# Energy math
+# Energy parsing & math
 # =========================
+def parse_llc_energy_consts(run_dir):
+    """
+    Try to read LLC energy constants from (in order):
+      1) sim.cfg
+      2) sim.info (Sniper's run summary with -g flags)
+      3) sim.inf  (some runs write this truncated name)
+
+    Returns dict in nJ/W on success, else None.
+    """
+    def _scan_text(txt):
+        # works for both "e_read_hit_pJ=397" and "--perf_model/.../e_read_hit_pJ=397 "
+        patt = {
+            "E_hit_nJ":  r'perf_model/l3_cache/llc/e_read_hit_pJ\s*=\s*([0-9.]+)',
+            "E_write_nJ":r'perf_model/l3_cache/llc/e_write_hit_pJ\s*=\s*([0-9.]+)',
+            "E_miss_nJ": r'perf_model/l3_cache/llc/e_miss_pJ\s*=\s*([0-9.]+)',
+            "P_leak_W":  r'perf_model/l3_cache/llc/p_leak_mW\s*=\s*([0-9.]+)',
+        }
+        out = {}
+        for k, rgx in patt.items():
+            m = re.search(rgx, txt)
+            if not m:
+                return None
+            val = float(m.group(1))
+            if k == "P_leak_W":
+                out[k] = val / 1000.0  # mW -> W
+            else:
+                out[k] = val / 1000.0  # pJ -> nJ
+        return out
+
+    # 1) sim.cfg
+    cfg = os.path.join(run_dir, "sim.cfg")
+    if os.path.exists(cfg):
+        try:
+            with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
+                vals = _scan_text(f.read())
+                if vals: return vals
+        except Exception:
+            pass
+
+    # 2) sim.info
+    info = os.path.join(run_dir, "sim.info")
+    if os.path.exists(info):
+        try:
+            with open(info, "r", encoding="utf-8", errors="ignore") as f:
+                vals = _scan_text(f.read())
+                if vals: return vals
+        except Exception:
+            pass
+
+    # 3) sim.inf (seen in your logs for a few benches)
+    info_alt = os.path.join(run_dir, "sim.inf")
+    if os.path.exists(info_alt):
+        try:
+            with open(info_alt, "r", encoding="utf-8", errors="ignore") as f:
+                vals = _scan_text(f.read())
+                if vals: return vals
+        except Exception:
+            pass
+
+    return None
+
 def energy_bounds(E_hit_nJ, E_miss_nJ, E_write_nJ, P_leak_W, T_s, acc, mis):
     hits = max(acc - mis, 0)
     dyn_lo_nJ = E_hit_nJ * hits + E_miss_nJ * mis   # assume all hits are reads
@@ -388,16 +460,22 @@ def main():
     s_avg_unc_ns = (float(s_lat.get("l3_uncore_time_sum_ns", 0)) / s_unc_reqs) if s_unc_reqs else ""
     n_avg_unc_ns = (float(n_lat.get("l3_uncore_time_sum_ns", 0)) / n_unc_reqs) if n_unc_reqs else ""
 
+    # --- Pick energy constants (sim.cfg overrides -> defaults) ---
+    s_consts = parse_llc_energy_consts(sram_dir) or SRAM_DEFAULT
+    n_consts = parse_llc_energy_consts(jans_dir) or JANS_DEFAULT
+
     # Bounds
-    (s_Elo, s_Ehi), (sd_lo, sd_hi), s_leakJ = energy_bounds(**SRAM, T_s=T_s, acc=A_s_txt, mis=M_s_txt)
-    (n_Elo, n_Ehi), (nd_lo, nd_hi), n_leakJ = energy_bounds(**JANS, T_s=T_n, acc=A_n_txt, mis=M_n_txt)
+    (s_Elo, s_Ehi), (sd_lo, sd_hi), s_leakJ = energy_bounds(
+        **s_consts, T_s=T_s, acc=A_s_txt, mis=M_s_txt)
+    (n_Elo, n_Ehi), (nd_lo, nd_hi), n_leakJ = energy_bounds(
+        **n_consts, T_s=T_n, acc=A_n_txt, mis=M_n_txt)
 
     # Exact energies
     s_dyn_exact = s_E_exact = float('nan')
     n_dyn_exact = n_E_exact = float('nan')
     s_exact_src = n_exact_src = ""
-    s_leakW = SRAM["P_leak_W"]
-    n_leakW = JANS["P_leak_W"]
+    s_leakW = s_consts["P_leak_W"]
+    n_leakW = n_consts["P_leak_W"]
 
     def mismatch_note(d):
         if d is None: return "sqlite_missing"
@@ -410,14 +488,14 @@ def main():
 
     if s_db is not None:
         s_dyn_exact, s_E_exact = energy_exact_from_counts(
-            SRAM["E_hit_nJ"], SRAM["E_miss_nJ"], SRAM["E_write_nJ"], s_leakW, T_s,
+            s_consts["E_hit_nJ"], s_consts["E_miss_nJ"], s_consts["E_write_nJ"], s_leakW, T_s,
             s_db["RH"], s_db["WH"], s_db["M_db"]
         )
         s_exact_src = "sqlite"
 
     if n_db is not None:
         n_dyn_exact, n_E_exact = energy_exact_from_counts(
-            JANS["E_hit_nJ"], JANS["E_miss_nJ"], JANS["E_write_nJ"], n_leakW, T_n,
+            n_consts["E_hit_nJ"], n_consts["E_miss_nJ"], n_consts["E_write_nJ"], n_leakW, T_n,
             n_db["RH"], n_db["WH"], n_db["M_db"]
         )
         n_exact_src = "sqlite"
@@ -521,15 +599,18 @@ def main():
 
     # ===== console summary =====
     print("\n==== Post-run LLC energy ====")
-    def pretty(cfg, T, A_txt, M_txt, E_bounds, leakJ, E_exact, note):
+    def pretty(cfg, T, A_txt, M_txt, E_bounds, leakJ, E_exact, note, consts_src):
         Elo, Ehi = E_bounds
+        src = "sim.cfg" if consts_src else "defaults"
         print(f"{cfg}: time={T:.6f}s  L3_txt_acc/miss={A_txt}/{M_txt}  "
               f"-> E_bounds={Elo:.6f}..{Ehi:.6f} J  (leak={leakJ:.6f} J)"
               f"{'  |  E_exact='+format(E_exact,'.6f')+' J' if E_exact==E_exact else ''}"
-              f"  ["+note+"]")
-    pretty("SRAM", T_s, A_s_txt, M_s_txt, (s_Elo, s_Ehi), s_leakJ, s_E_exact, s_note)
-    pretty("JanS", T_n, A_n_txt, M_n_txt, (n_Elo, n_Ehi), n_leakJ, n_E_exact, n_note)
+              f"  [stats:{note}; consts:{src}]")
+
+    pretty("SRAM", T_s, A_s_txt, M_s_txt, (s_Elo, s_Ehi), s_leakJ, s_E_exact, s_note,
+           parse_llc_energy_consts(sram_dir) is not None)
+    pretty("JanS", T_n, A_n_txt, M_n_txt, (n_Elo, n_Ehi), n_leakJ, n_E_exact, n_note,
+           parse_llc_energy_consts(jans_dir) is not None)
 
 if __name__ == "__main__":
     main()
-
