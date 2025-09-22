@@ -157,11 +157,13 @@ elif ls "$RAW_DIR"/memtrace.*.log >/dev/null 2>&1; then
   TRACE_SRC="$(ls -t "$RAW_DIR"/memtrace.*.log | head -1)"
 fi
 
-if [[ -z "${TRACE_SRC:-}" || ! -f "$TRACE_SRC" ]]; then
-  err "No memtrace log found in $RAW_DIR. See $(basename "$DRR_LOG")"; popd >/dev/null; exit 2
+mapfile -t TRACE_SRCS < <(ls -1t "$RAW_DIR"/memtrace.*"$APP"*.log 2>/dev/null || true)
+if [[ ${#TRACE_SRCS[@]} -eq 0 ]]; then
+  err "No memtrace logs for $APP in $RAW_DIR"; exit 2
 fi
+TRACE_DST="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.allthreads.log"
+cat "${TRACE_SRCS[@]}" > "$TRACE_DST"
 
-TRACE_DST="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.log"
 info "[INFO] Trace src: $TRACE_SRC"
 cp -p "$TRACE_SRC" "$TRACE_DST"
 ok "Trace saved: $TRACE_DST"
