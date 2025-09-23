@@ -145,6 +145,131 @@ gzip -f "$RAW"/memtrace.*.log 2>/dev/null || true
 
 echo ">>> done $BEN | RAW=$RAW"
 '
+
+# Rather than above, try this
+# This filters stack
+
+# --- env you can tweak ---
+export DR="$HOME/opt/DynamoRIO-Linux-11.3.0-1"
+export TRACE_SEC=30
+export RUN_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+
+sbatch --job-name=spec-trace-linestack --partition=cpu-q --cpus-per-task=2 --mem=8G --time=02:00:00 \
+--array=0-11 \
+--output=spec-trace-linestack-%A_%a.out --error=spec-trace-linestack-%A_%a.err \
+--export=ALL,DR,TRACE_SEC,RUN_TAG \
+--wrap '
+set -euo pipefail
+
+OUT="$PWD/results_trace"; mkdir -p "$OUT/traces"
+SCRIPT="$SLURM_SUBMIT_DIR/scripts/mem_metrics_unit.py"   # expects your script here
+
+# Output CSVs (separate files per size)
+CSV_TEST="$OUT/features_line_nostack_test_${RUN_TAG}.csv"
+CSV_TRAIN="$OUT/features_line_nostack_train_${RUN_TAG}.csv"
+
+# Benches (12 entries)
+BENCHES=( "541.leela_r" "531.deepsjeng_r" "520.omnetpp_r" "648.exchange2_s"
+          "505.mcf_r"   "523.xalancbmk_r" "500.perlbench_r" "502.gcc_r"
+          "557.xz_r"    "619.lbm_s"       "621.wrf_s"       "649.fotonik3d_s" )
+i=${SLURM_ARRAY_TASK_ID}
+BEN=${BENCHES[$i]}
+
+for SIZE in test train; do
+  # Resolve a run dir that matches the size; skip if none
+  RUN=$(ls -dt "$HOME/spec2017/benchspec/CPU/$BEN/run"/run_*${SIZE}* 2>/dev/null | head -1 || true)
+  if [[ -z "${RUN:-}" ]]; then
+    echo "[skip] $BEN ($SIZE): no run_*${SIZE}* dir found"
+    continue
+  fi
+
+  # Binary & args (from this RUN dir)
+  BIN=$(find "$RUN" -maxdepth 2 -type f -name "*_base.*" | head -1)
+  [[ -z "${BIN:-}" ]] && { echo "[skip] $BEN ($SIZE): no *_base.* binary"; continue; }
+  APP=$(basename "$BIN")
+
+  ARGS=""
+  if [[ -f "$RUN/speccmds.cmd" ]]; then
+    LINE=$(grep -m1 -E "../run_base[^ ]+/[^ ]+_base[^ ]+|./[^ ]+_base[^ ]+" "$RUN/speccmds.cmd" || true)
+    if [[ -n "$LINE" ]]; then
+      LINE_TRIM="${LINE%%>*}"
+      ARGS="$(echo "$LINE_TRIM" | sed -E "s@.*_base[^ ]+[[:space:]]*(.*)$@\\1@" | xargs || true)"
+    fi
+  fi
+  [[ -z "$ARGS" && -f "$RUN/test.txt" ]] && ARGS="test.txt"
+  [[ -z "$ARGS" && -f "$RUN/test.sgf" ]] && ARGS="test.sgf"
+  case "$BEN" in
+    648.exchange2_s) [[ -z "$ARGS" ]] && ARGS="2" ;;
+    505.mcf_r)       [[ -z "$ARGS" && -f "$RUN/inp.in" ]] && ARGS="inp.in" ;;
+    557.xz_r)
+      if [[ -z "$ARGS" ]]; then
+        XZ=$(ls -1 "$RUN"/*.xz 2>/dev/null | head -1 || true)
+        [[ -n "$XZ" ]] && ARGS="-dkc $(basename "$XZ")"
+      fi
+      ;;
+    619.lbm_s)
+      if [[ -z "$ARGS" ]]; then
+        IN=$(ls -1 "$RUN"/*.in 2>/dev/null | head -1 || true)
+        [[ -n "$IN" ]] && ARGS="$(basename "$IN")"
+      fi
+      ;;
+  esac
+
+  # Raw trace dir per bench & size
+  RAW="$OUT/traces/diag.raw.${BEN//./_}.${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.${SIZE}"
+  mkdir -p "$RAW"
+  ln -sf "$DR/samples/bin64/libmemtrace_x86_text.so" "$RAW/libmemtrace_x86_text.so"
+
+  echo "[run ] $BEN ($SIZE)  RUN=$RUN"
+  cd "$RUN"
+
+  # Run: timeout OUTSIDE drrun; logs go under RAW
+  /usr/bin/timeout "${TRACE_SEC}s" \
+    "$DR/bin64/drrun" -root "$DR" -follow_children \
+    -c "$RAW/libmemtrace_x86_text.so" -- \
+    "$BIN" ${ARGS:+$ARGS} \
+    1>"$RAW/job.stdout" 2>"$RAW/job.stderr" || true
+
+  # Compress thread logs
+  gzip -f "$RAW"/memtrace.*.log 2>/dev/null || true
+
+  # Gather all per-thread logs (prefer app-matched), compute features
+  mapfile -t LOGS < <(ls -1 "$RAW"/memtrace.*"$APP"*.log.gz 2>/dev/null || true)
+  if [[ ${#LOGS[@]} -eq 0 ]]; then
+    mapfile -t LOGS < <(ls -1 "$RAW"/memtrace.*.log.gz 2>/dev/null || true)
+  fi
+
+  if [[ ${#LOGS[@]} -gt 0 && -f "$SCRIPT" ]]; then
+    TMP="$RAW/features.tmp.csv"
+    python3 "$SCRIPT" --unit line --exclude-stack --M 6 \
+      --name "$BEN" --csv "$TMP" "${LOGS[@]}" || true
+
+    # Append atomically to the size-specific CSV
+    OUTCSV="$CSV_TEST"
+    [[ "$SIZE" == "train" ]] && OUTCSV="$CSV_TRAIN"
+
+    if [[ -f "$TMP" ]]; then
+      exec 9>"$OUTCSV.lock"; flock 9
+      if [[ ! -f "$OUTCSV" ]]; then
+        cp "$TMP" "$OUTCSV"
+      else
+        tail -n +2 "$TMP" >> "$OUTCSV"
+      fi
+      flock -u 9; exec 9>&-
+      rm -f "$TMP"
+      echo "[feat] appended $BEN ($SIZE) -> $OUTCSV"
+    else
+      echo "[warn] no features produced for $BEN ($SIZE)"
+    fi
+  else
+    echo "[warn] no logs found for $BEN ($SIZE) in $RAW"
+  fi
+
+done
+
+echo "Done: CSV(test)=$CSV_TEST  CSV(train)=$CSV_TRAIN"
+'
+
 ```
 
 ---

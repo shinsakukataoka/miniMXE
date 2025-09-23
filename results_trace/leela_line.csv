@@ -1,0 +1,3 @@
+name,M,read_total,read_unique,read_entropy,read_local_entropy,read_footprint90,write_total,write_unique,write_entropy,write_local_entropy,write_footprint90
+541.leela_r_line_nostack,10,6125170,9558,7.244344,4.752807,235,283843,39482,12.699537,9.207856,24873
+541.leela_r_line,10,23107011,9794,4.724778,2.831501,61,9383175,39615,2.887896,1.032988,5
