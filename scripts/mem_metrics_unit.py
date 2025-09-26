@@ -3,6 +3,44 @@ import argparse, re, math, os, gzip
 from collections import Counter
 
 LINE_COLON = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s*:\s*(\d+)\s*,\s*([A-Za-z]+)')
+VIEW_RW_COMMA = re.compile(r'.*?,\s*([RrWw])\s*,\s*(\d+)\s*,\s*(0x[0-9a-fA-F]+)')
+VIEW_RW_SPACE = re.compile(r'^\s*\d+\s+\d+:\s+\d+\s+(read|write)\s+(\d+)\s+byte\(s\)\s+@\s+(0x[0-9a-fA-F]+)')
+
+def parse_kind_addr(line):
+    # 1) "0xADDR: SIZE, KIND"
+    m = LINE_COLON.match(line)
+    if m:
+        addr = int(m.group(1), 16)
+        k = m.group(3).lower()
+        if k.startswith('r'):  return 'R', addr
+        if k.startswith('w'):  return 'W', addr
+        return None, None
+
+    # 2) CSV "pc,r/w,size,addr"
+    parts = [p.strip() for p in line.split(',')]
+    if len(parts) >= 4:
+        k = parts[1].lower()
+        try:
+            if k.startswith('r') or k == 'load':  return 'R', int(parts[3], 16)
+            if k.startswith('w') or k == 'store': return 'W', int(parts[3], 16)
+        except Exception:
+            pass
+
+    # 3) drcachesim view (comma form)
+    m = VIEW_RW_COMMA.match(line)
+    if m:
+        kind = 'R' if m.group(1).lower().startswith('r') else 'W'
+        addr = int(m.group(3), 16)
+        return kind, addr
+
+    # 4) drcachesim view (space form like: "write 8 byte(s) @ 0xADDR ...")
+    m = VIEW_RW_SPACE.match(line)
+    if m:
+        kind = 'R' if m.group(1).lower() == 'read' else 'W'
+        addr = int(m.group(3), 16)
+        return kind, addr
+
+    return None, None
 
 def entropy(counter):
     t = sum(counter.values())
@@ -43,8 +81,19 @@ def parse_kind_addr(line):
         if k.startswith('w'): return 'W', addr
     return None, None
 
+# scripts/mem_metrics_unit.py
+import os, gzip
 def open_any(path):
-    return gzip.open(path, 'rt', errors='ignore') if path.endswith('.gz') else open(path, 'r', errors='ignore')
+    if path.endswith('.gz'):
+        return gzip.open(path, 'rt', errors='ignore')
+    plain_exists = os.path.exists(path)
+    gz_exists    = os.path.exists(path + '.gz')
+    plain_is_empty = plain_exists and os.path.getsize(path) == 0
+    if plain_exists and not plain_is_empty:
+        return open(path, 'r', errors='ignore')
+    if gz_exists:
+        return gzip.open(path + '.gz', 'rt', errors='ignore')
+    raise FileNotFoundError(path)
 
 def compute_metrics(paths, M, unit_shift, exclude_stack):
     R = Counter(); W = Counter(); Rloc = Counter(); Wloc = Counter()

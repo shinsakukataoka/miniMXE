@@ -51,12 +51,12 @@ mkdir -p "$OUT_ROOT" "$OUT_ROOT/traces" "$TMPDIR"
 SHORT="${BENCH//./_}"
 TIMINGS_CSV="$OUT_ROOT/timings.csv"
 
-# Unique RAW dir; symlink the client here so logs land *in this dir*
+# Unique RAW dir on node-local TMP, ensure logs land *here* by loading client from this dir
 RAW_ID="${SLURM_ARRAY_TASK_ID:-$PPID}"
-RAW_DIR="$OUT_ROOT/traces/raw.${RAW_ID}.${SHORT}"
+RAW_DIR="$TMPDIR/drraw.${RAW_ID}.${SHORT}"
 mkdir -p "$RAW_DIR"
 ln -sf "$DR_HOME/samples/bin64/libmemtrace_x86_text.so" "$RAW_DIR/libmemtrace_x86_text.so"
-info "[INFO] DR memtrace RAW dir: $RAW_DIR"
+info "[INFO] DR memtrace RAW dir (node-local): $RAW_DIR"
 
 # -------- Sanity --------
 info "\n==== Sanity checks ===="
@@ -120,7 +120,6 @@ ok "Args    : ${ARGS:-<none>}"
 # -------- Optional native timing (no tools) --------
 info "\n==== Native timing (no tools) ===="
 pushd "$RUN_DIR" >/dev/null
-# append timing row (simple)
 start=$(date +%s.%N); ( "$BIN" ${ARGS:+$ARGS} ) >/dev/null 2>&1 || true; end=$(date +%s.%N)
 dur=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", (e-s)}')
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -131,67 +130,71 @@ popd >/dev/null
 info "\n==== DynamoRIO (${TRACE_SEC}s text trace) + features ===="
 pushd "$RUN_DIR" >/dev/null
 
-MARKER="$(mktemp "$TMPDIR/memtrace.marker.XXXX")"; touch "$MARKER"
 DATE_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
 DRR_LOG="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.drrun.stderr.log"
 
-# run drrun wrapping timeout, client loaded from RAW_DIR
+set +e
 start=$(date +%s.%N)
 "$DR_HOME/bin64/drrun" ${DR_DEBUG:+-debug -verbose 2} \
   -root "$DR_HOME" -follow_children \
   -c "$RAW_DIR/libmemtrace_x86_text.so" -- \
   /usr/bin/timeout "${TRACE_SEC}s" "$BIN" ${ARGS:+$ARGS} \
-  1>"$RAW_DIR/runner.stdout.log" 2>"$DRR_LOG" || RC=$?
+  1>"$RAW_DIR/runner.stdout.log" 2>"$DRR_LOG"
+RC=$?
 end=$(date +%s.%N)
+set -e
+
 dur=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", (e-s)}')
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 { [[ -f "$TIMINGS_CSV" ]] || echo "timestamp,bench,label,seconds,rc";
   echo "$ts,$BENCH,drrun_memtrace_${TRACE_SEC}s,$dur,${RC:-0}"; } >> "$TIMINGS_CSV"
 
-# harvest strictly from RAW_DIR; prefer app-matched
 APP="$(basename "$BIN")"
-TRACE_SRC=""
-if ls "$RAW_DIR"/memtrace.*"$APP"*.log >/dev/null 2>&1; then
-  TRACE_SRC="$(ls -t "$RAW_DIR"/memtrace.*"$APP"*.log | head -1)"
-elif ls "$RAW_DIR"/memtrace.*.log >/dev/null 2>&1; then
-  TRACE_SRC="$(ls -t "$RAW_DIR"/memtrace.*.log | head -1)"
-fi
 
+# Collect all per-thread logs from RAW_DIR (prefer app-matched)
 mapfile -t TRACE_SRCS < <(ls -1t "$RAW_DIR"/memtrace.*"$APP"*.log 2>/dev/null || true)
 if [[ ${#TRACE_SRCS[@]} -eq 0 ]]; then
-  err "No memtrace logs for $APP in $RAW_DIR"; exit 2
+  mapfile -t TRACE_SRCS < <(ls -1t "$RAW_DIR"/memtrace.*.log 2>/dev/null || true)
 fi
-TRACE_DST="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.allthreads.log"
-cat "${TRACE_SRCS[@]}" > "$TRACE_DST"
+[[ ${#TRACE_SRCS[@]} -eq 0 ]] && { err "No memtrace logs in $RAW_DIR"; exit 2; }
 
-info "[INFO] Trace src: $TRACE_SRC"
-cp -p "$TRACE_SRC" "$TRACE_DST"
-ok "Trace saved: $TRACE_DST"
+TRACE_DST_TMP="$RAW_DIR/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.allthreads.log"
+cat "${TRACE_SRCS[@]}" > "$TRACE_DST_TMP"
+ok "Merged trace (all threads): $TRACE_DST_TMP"
 
 # ---- Features: compute then append under a short lock ----
 if [[ -f "$DR_HOME/samples/mem_metrics_v3.py" ]]; then
-  TMP_FEATURES="$OUT_ROOT/features.tmp.${DATE_TAG}_${SHORT}.csv"
-  python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$TMP_FEATURES" --M "$FEATURES_M" "$TRACE_DST"
+  TMP_FEATURES="$RAW_DIR/features.tmp.${DATE_TAG}_${SHORT}.csv"
+  python3 "$DR_HOME/samples/mem_metrics_v3.py" --name "$BENCH" --csv "$TMP_FEATURES" --M "$FEATURES_M" "$TRACE_DST_TMP" || warn "Feature extraction failed"
 
-  # short critical section to append
-  exec 9>"$FEATURES_CSV.lock"
-  flock 9
-  if [[ ! -f "$FEATURES_CSV" ]]; then
-    cp "$TMP_FEATURES" "$FEATURES_CSV"
-  else
-    tail -n +2 "$TMP_FEATURES" >> "$FEATURES_CSV"
+  if [[ -f "$TMP_FEATURES" ]]; then
+    mkdir -p "$(dirname "$FEATURES_CSV")"
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>"$FEATURES_CSV.lock"
+      flock 9
+      if [[ ! -f "$FEATURES_CSV" ]]; then
+        cp "$TMP_FEATURES" "$FEATURES_CSV"
+      else
+        tail -n +2 "$TMP_FEATURES" >> "$FEATURES_CSV"
+      fi
+      flock -u 9
+      exec 9>&-
+    else
+      { [[ -f "$FEATURES_CSV" ]] || head -n1 "$TMP_FEATURES" > "$FEATURES_CSV"; tail -n +2 "$TMP_FEATURES" >> "$FEATURES_CSV"; }
+    fi
+    rm -f "$TMP_FEATURES"
+    ok "Features appended to: $FEATURES_CSV"
   fi
-  flock -u 9
-  exec 9>&-
-  rm -f "$TMP_FEATURES"
-  ok "Features written to: $FEATURES_CSV"
 else
   warn "mem_metrics_v3.py not found at $DR_HOME/samples/mem_metrics_v3.py; skipping features"
 fi
 
-# Optional: compress after features
-if [[ "$COMPRESS_TRACE" == "1" ]]; then
-  if command -v gzip >/dev/null 2>&1; then gzip -f "$TRACE_DST"; TRACE_DST="${TRACE_DST}.gz"; ok "Compressed trace: $TRACE_DST"; fi
+# Move/Compress final trace artifact to OUT_ROOT
+FINAL_DST="$OUT_ROOT/traces/${DATE_TAG}_${SHORT}_${TRACE_SEC}s.allthreads.log"
+mkdir -p "$OUT_ROOT/traces"
+mv -f "$TRACE_DST_TMP" "$FINAL_DST"
+if [[ "$COMPRESS_TRACE" == "1" ]] && command -v gzip >/dev/null 2>&1; then
+  gzip -f "$FINAL_DST"; FINAL_DST="${FINAL_DST}.gz"; ok "Compressed trace: $FINAL_DST"
 fi
 
 popd >/dev/null
@@ -202,8 +205,7 @@ echo "Bench        : $BENCH"
 echo "Run dir      : $RUN_DIR"
 echo "Binary       : $BIN"
 echo "Args         : ${ARGS:-<none>}"
-echo "Trace src    : $TRACE_SRC"
-echo "Trace file   : $TRACE_DST"
+echo "Trace file   : $FINAL_DST"
 echo "Timings CSV  : $TIMINGS_CSV"
 echo "Features CSV : $FEATURES_CSV"
 echo
