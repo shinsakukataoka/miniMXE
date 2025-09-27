@@ -125,7 +125,7 @@ fi
 
 set +e
 "$DR_HOME/bin64/drrun" "${DR_LAUNCH_OPTS[@]}" "${TRACER_OPTS[@]}" -- "${APP_CMD[@]}" \
-  1>"$DRR_LOG" 2>"$RAW_DIR/runner.stderr.log"
+  1>"$RAW_DIR/runner.stdout.log" 2>"$DRR_LOG"
 RC=$?
 set -e
 popd >/dev/null
