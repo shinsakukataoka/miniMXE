@@ -1,0 +1,36 @@
+script: scripts/spec_trace_array.sbatch
+sbatch_args:
+  - --job-name=dr-rwstats
+  - --time=120:00:00
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SPEC_SIZE: ref
+  CAP_MODE: instr
+  WARMUP_M: 100
+  ROI_M: 1000
+  OUT_ROOT: "${PWD}/results_trace"
+  # tool locations (your defaults already match these; override if needed)
+  DR_HOME: "${HOME}/opt/DynamoRIO-Linux-11.3.0-1"
+  SPEC_ROOT: "${HOME}/spec2017"
+  GCC_DIR: "/cm/local/apps/gcc/13.1.0"
+  DR_DEBUG: 0
+
+  # rwstats knobs
+  RWSTATS_INTERVAL: 5000000
+  RWSTATS_LOCAL_BITS: 12
+  RWSTATS_STRIDE_CAP_BYTES: 8388608   # 8 MiB
+  RWSTATS_DISABLE_STRIDE: 0
+  RWSTATS_FINAL_LINES: 1
+
+# Optional bench override (requires tiny edit above)
+# benchmarks:
+#   - 541.leela_r
+#   - 531.deepsjeng_r
+#   - 520.omnetpp_r
+#   - 648.exchange2_s
+
+notes:
+  - Online drmemtrace + rwstats; warm 100M + ROI 1000M; SPEC ref
+

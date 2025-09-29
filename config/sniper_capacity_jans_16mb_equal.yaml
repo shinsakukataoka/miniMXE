@@ -1,0 +1,23 @@
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-cap-16m
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  ENABLE_LLC_ENERGY: 0      # do NOT inject 2MB constants
+  OUT_ROOT: "${PWD}/results/sniper_cap_equal_16mb_{timestamp}"
+llc:
+  sram:
+    size_bytes: 16777216     # 16 MB
+    read_hit_cycles: 4       # keep cycles same as baseline unless you re-gen latencies
+    write_hit_cycles: 2
+  jans:
+    size_bytes: 16777216
+    read_hit_cycles: 8
+    write_hit_cycles: 21
+

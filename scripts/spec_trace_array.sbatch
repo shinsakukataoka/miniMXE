@@ -3,7 +3,7 @@
 #SBATCH --partition=cpu-q
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH --time=02:00:00
+#SBATCH --time=120:00:00
 #SBATCH --array=0-11
 #SBATCH --output=%x-%A_%a.out
 #SBATCH --error=%x-%A_%a.err
@@ -17,6 +17,11 @@ BENCHES=(
   "505.mcf_r"   "523.xalancbmk_r" "500.perlbench_r" "502.gcc_r"
   "557.xz_r"    "619.lbm_s"       "621.wrf_s"       "649.fotonik3d_s"
 )
+
+# Allow BENCHMARKS="a,b,c" to override default list
+if [[ -n "${BENCHMARKS:-}" ]]; then
+  IFS=',' read -r -a BENCHES <<< "$BENCHMARKS"
+fi
 
 # === Run settings ===
 SPEC_SIZE="${SPEC_SIZE:-test}"      # test|train

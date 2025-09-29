@@ -1,0 +1,34 @@
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-dev-xues
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_dev_xues_2mb_{timestamp}"
+llc:
+  sram:
+    size_bytes: 2097152
+    read_hit_cycles: 4
+    write_hit_cycles: 2
+    energy:
+      enabled: true
+      e_read_hit_pJ: 565
+      e_write_hit_pJ: 537
+      e_miss_pJ: 11
+      p_leak_mW: 3438
+  jans:
+    size_bytes: 2097152
+    read_hit_cycles: 8      # XueS 2MB: read ~2.878ns -> 8c
+    write_hit_cycles: 11    # XueS 2MB: write ~4.038ns  -> 11c
+    energy:
+      enabled: true
+      e_read_hit_pJ: 251
+      e_write_hit_pJ: 597
+      e_miss_pJ: 121
+      p_leak_mW: 115
+

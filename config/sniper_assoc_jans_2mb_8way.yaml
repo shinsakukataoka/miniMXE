@@ -1,0 +1,35 @@
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-assoc-8w
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_assoc_jans2mb_8way_{timestamp}"
+  JANS_L3_ASSOC: 8          # only JanS path takes assoc from env; SRAM stays at default 16-way
+llc:
+  sram:
+    size_bytes: 2097152
+    read_hit_cycles: 4
+    write_hit_cycles: 2
+    energy:
+      enabled: true
+      e_read_hit_pJ: 565
+      e_write_hit_pJ: 537
+      e_miss_pJ: 11
+      p_leak_mW: 3438
+  jans:
+    size_bytes: 2097152
+    read_hit_cycles: 8
+    write_hit_cycles: 21
+    energy:
+      enabled: true
+      e_read_hit_pJ: 188
+      e_write_hit_pJ: 2305
+      e_miss_pJ: 77
+      p_leak_mW: 48
+

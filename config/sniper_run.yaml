@@ -1,0 +1,49 @@
+script: scripts/run_all.sbatch
+
+sbatch_args:
+  - --job-name=sniper-fixedcap
+  - --time=120:00:00
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000        # your scripts use ROI (M). submitter maps ROI_M -> ROI
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_roi1000_fixedcap2m_{timestamp}"
+
+# Optional: override which benches to run (requires tiny edit above)
+# benchmarks:
+#   - 541.leela_r
+#   - 531.deepsjeng_r
+#   - 520.omnetpp_r
+#   - 648.exchange2_s
+
+llc:
+  sram:
+    size_bytes: 2097152           # 2 MiB
+    read_hit_cycles: 4
+    write_hit_cycles: 2
+    energy:
+      enabled: true               # sets ENABLE_LLC_ENERGY=1
+      e_read_hit_pJ: 565
+      e_write_hit_pJ: 537
+      e_miss_pJ: 11
+      p_leak_mW: 3438
+  jans:
+    size_bytes: 2097152
+    read_hit_cycles: 8
+    write_hit_cycles: 21
+    energy:
+      enabled: true
+      e_read_hit_pJ: 188
+      e_write_hit_pJ: 2305
+      e_miss_pJ: 77
+      p_leak_mW: 48
+
+notes:
+  - Per-op LLC hit cycles only (no tags/data_access_time)
+  - Fixed-capacity 2MB vs 2MB; SPEC ref; 4 cores; warm 100M; ROI 1000M
+

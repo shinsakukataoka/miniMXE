@@ -306,8 +306,6 @@ timelog_run "sniper_jans" "$TIMINGS_CSV" -- \
   run_sniper "$OUT_JANS" \
     -g perf_model/l3_cache/cache_size=$(( JANS_L3_SIZE / 1024 )) \
     -g perf_model/l3_cache/associativity="${JANS_L3_ASSOC}" \
-    -g perf_model/l3_cache/tags_access_time="${L3_TAGS_CYC}" \
-    -g perf_model/l3_cache/data_access_time="${JANS_L3_LAT}" \
     -g perf_model/l3_cache/llc/read_hit_latency_cycles="${JANS_L3_LAT_RD}" \
     -g perf_model/l3_cache/llc/write_hit_latency_cycles="${JANS_L3_LAT_WR}" \
     $(build_energy_flags jans)

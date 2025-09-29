@@ -1,0 +1,34 @@
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-dev-chungs
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_dev_chungs_2mb_{timestamp}"
+llc:
+  sram:
+    size_bytes: 2097152
+    read_hit_cycles: 4
+    write_hit_cycles: 2
+    energy:
+      enabled: true
+      e_read_hit_pJ: 565
+      e_write_hit_pJ: 537
+      e_miss_pJ: 11
+      p_leak_mW: 3438
+  jans:
+    size_bytes: 2097152
+    read_hit_cycles: 5     # ChungS 2MB: read ~1.763ns -> 5c
+    write_hit_cycles: 32   # ChungS 2MB: write ~11.751ns -> 32c
+    energy:
+      enabled: true
+      e_read_hit_pJ: 209
+      e_write_hit_pJ: 1332
+      e_miss_pJ: 82
+      p_leak_mW: 166
+

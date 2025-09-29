@@ -3,7 +3,7 @@
 #SBATCH --partition=cpu-q
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
-#SBATCH --time=72:00:00
+#SBATCH --time=120:00:00
 #SBATCH --array=0-11
 #SBATCH --output=%x-%A_%a.out
 #SBATCH --error=%x-%A_%a.err
@@ -97,6 +97,10 @@ else
     "505.mcf_r" "523.xalancbmk_r" "500.perlbench_r" "502.gcc_r"
     "557.xz_r" "619.lbm_s" "621.wrf_s" "649.fotonik3d_s"
   )
+
+  if [[ -n "${BENCHMARKS:-}" ]]; then
+    IFS=',' read -r -a BENCHES <<< "$BENCHMARKS"
+  fi
 
   if [[ ${SLURM_ARRAY_TASK_ID:-0} -ge ${#BENCHES[@]} ]]; then
     echo "[ERR] SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset} out of range"
