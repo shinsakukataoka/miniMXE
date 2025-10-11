@@ -1,0 +1,54 @@
+# Auto-generated from NVSim pairs (SRAM + JanS) for 4MB, 16-way
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-llc-4mb-16w
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_llc_4mb_16w_{timestamp}"
+
+llc:
+  sram:
+    # ---- hard-coded from NVSim ----
+    size_bytes: 4194304           # 4 MB
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300.000
+    tech_node_nm: 32
+    read_hit_cycles: 6      # ceil(2.009 ns / 0.37594 ns)
+    write_hit_cycles: 4     # ceil(1.262 ns / 0.37594 ns)
+    energy:
+      enabled: true
+      e_read_hit_pJ: 684        # 0.684 nJ
+      e_write_hit_pJ: 634       # 0.634 nJ
+      e_miss_pJ: 684            # NVSim miss ~= hit
+      p_leak_mW: 34.745
+
+  jans:
+    # ---- hard-coded from NVSim STTRAM ----
+    size_bytes: 4194304           # 4 MB
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 32
+    read_hit_cycles: 8      # ceil(2.632 ns / 0.37594 ns)
+    write_hit_cycles: 30     # ceil(10.939 ns / 0.37594 ns)
+    energy:
+      enabled: true
+      e_read_hit_pJ: 869        # 0.869 nJ
+      e_write_hit_pJ: 532       # 0.532 nJ
+      e_miss_pJ: 869            # NVSim miss ~= hit
+      p_leak_mW: 19.031
+
+notes:
+  - Cycle period (ns): 0.37594
+  - Source SRAM: /home/skataoka26/COSC_498/devices/results/cache_triplet/C4MB_A16_W512_T300_20251002T012145Z/SRAM/SRAM.stdout.txt
+  - Source JanS: /home/skataoka26/COSC_498/devices/results/cache_triplet/C4MB_A16_W512_T300_20251002T012145Z/STTRAM/STTRAM.stdout.txt

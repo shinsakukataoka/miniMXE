@@ -1,0 +1,54 @@
+# Auto-generated from NVSim pairs (SRAM + JanS) for 32MB, 8-way
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-llc-32mb-8w
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_llc_32mb_8w_{timestamp}"
+
+llc:
+  sram:
+    # ---- hard-coded from NVSim ----
+    size_bytes: 33554432           # 32 MB
+    assoc_ways: 8
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300.000
+    tech_node_nm: 32
+    read_hit_cycles: 25      # ceil(9.069 ns / 0.37594 ns)
+    write_hit_cycles: 13     # ceil(4.847 ns / 0.37594 ns)
+    energy:
+      enabled: true
+      e_read_hit_pJ: 1629        # 1.629 nJ
+      e_write_hit_pJ: 1466       # 1.466 nJ
+      e_miss_pJ: 1629            # NVSim miss ~= hit
+      p_leak_mW: 90.228
+
+  jans:
+    # ---- hard-coded from NVSim STTRAM ----
+    size_bytes: 33554432           # 32 MB
+    assoc_ways: 8
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 32
+    read_hit_cycles: 16      # ceil(5.896 ns / 0.37594 ns)
+    write_hit_cycles: 34     # ceil(12.537 ns / 0.37594 ns)
+    energy:
+      enabled: true
+      e_read_hit_pJ: 1508        # 1.508 nJ
+      e_write_hit_pJ: 1215       # 1.215 nJ
+      e_miss_pJ: 1508            # NVSim miss ~= hit
+      p_leak_mW: 49.987
+
+notes:
+  - Cycle period (ns): 0.37594
+  - Source SRAM: /home/skataoka26/COSC_498/devices/results/cache_triplet/C32MB_A8_W512_T300_20251002T012145Z/SRAM/SRAM.stdout.txt
+  - Source JanS: /home/skataoka26/COSC_498/devices/results/cache_triplet/C32MB_A8_W512_T300_20251002T012145Z/STTRAM/STTRAM.stdout.txt

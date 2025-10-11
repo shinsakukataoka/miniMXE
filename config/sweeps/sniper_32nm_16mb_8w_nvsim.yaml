@@ -1,0 +1,49 @@
+# Auto-generated from NVSim for 32nm, 16MB, 8-way
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-llc-32nm-16mb-16w
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_llc_32nm_16mb_8w_{timestamp}"
+
+llc:
+  sram:
+    # ---- pulled from NVSim summary ----
+    size_bytes: 16777216
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 32
+    read_hit_cycles: 166
+    write_hit_cycles: 121
+    energy:
+      enabled: true
+      e_read_hit_pJ: 2184
+      e_write_hit_pJ: 46
+      e_miss_pJ: 2184
+      p_leak_mW: 28.890
+
+  jans:
+    # ---- pulled from NVSim (MRAM/STT-RAM) ----
+    size_bytes: 16777216
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 32
+    read_hit_cycles: 324
+    write_hit_cycles: 209
+    energy:
+      enabled: true
+      e_read_hit_pJ: 511
+      e_write_hit_pJ: 124
+      e_miss_pJ: 511
+      p_leak_mW: 3.374

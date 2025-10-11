@@ -3,6 +3,8 @@ results/
 traces/
 features.csv
 *.log
+logs/
+results_trace/
 
 # Python
 __pycache__/

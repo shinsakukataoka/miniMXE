@@ -1,0 +1,56 @@
+# Latency-equalized variant: JanS read_hit_cycles matched to SRAM (cycles only)
+# Auto-generated from NVSim pairs (SRAM + JanS) for 32MB, 16-way
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-llc-32mb-16w-ReadEq
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_llc_32mb_16w_ReadEq_{timestamp}"
+
+llc:
+  sram:
+    # ---- hard-coded from NVSim ----
+    size_bytes: 33554432           # 32 MB
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300.000
+    tech_node_nm: 32
+    read_hit_cycles: 25      # ceil(9.050 ns / 0.37594 ns)
+    write_hit_cycles: 13     # ceil(4.833 ns / 0.37594 ns)
+    energy:
+      enabled: true
+      e_read_hit_pJ: 1650        # 1.650 nJ
+      e_write_hit_pJ: 1486       # 1.486 nJ
+      e_miss_pJ: 1650
+      p_leak_mW: 90.225
+
+  jans:
+    # ---- JanS with READ-HIT cycles equalized to SRAM for causality test ----
+    size_bytes: 33554432           # 32 MB
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 32
+    read_hit_cycles: 25      # <-- equalized (was 16)
+    write_hit_cycles: 34
+    energy:
+      enabled: true
+      e_read_hit_pJ: 1458        # unchanged
+      e_write_hit_pJ: 1107       # unchanged
+      e_miss_pJ: 1458            # unchanged
+      p_leak_mW: 34.519          # unchanged
+
+notes:
+  - Cycle period (ns): 0.37594
+  - VARIANT: JanS read_hit_cycles equalized to SRAM (cycles only; energies unchanged)
+  - Source SRAM: /home/skataoka26/COSC_498/devices/results/cache_triplet/C32MB_A16_W512_T300_20251002T012145Z/SRAM/SRAM.stdout.txt
+  - Source JanS: /home/skataoka26/COSC_498/devices/results/cache_triplet/C32MB_A16_W512_T300_20251002T012145Z/STTRAM/STTRAM.stdout.txt

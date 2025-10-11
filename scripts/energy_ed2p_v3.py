@@ -4,8 +4,11 @@ Compute LLC-only energy/ED^2P for SRAM vs JanS (or any "tech" run in the JanS sl
 
 What this script does:
 - Reads timing + coarse L3 stats from each run's sim.out
-- Reads exact L3 hit/miss breakdown from sim.stats.sqlite3
-- NEW: Reads LLC energy constants (pJ/mW) from each run's sim.cfg if present
+- Reads exact L3 hit/miss breakdown from sim.stats.sqlite3 (ROI delta = roi-end - roi-begin)
+- Includes all L3 slices for hit counters (objectname LIKE 'L3%': local + remote/forwarded)
+- Reads LLC energy constants (pJ/mW) from each run's sim.cfg if present
+- Weighted LLC hit cycles if sim.cfg defines llc.next_read, using ROI hit mix
+- Optionally rebalances missing hits (coherency upgrades) into write-hits for energy
 - Writes CSVs into: <OUT_ROOT>/output_<bench>/
     * energy_bounds.csv   (includes exact energy + bounds)
     * summary.csv         (text + sqlite stats side-by-side + avg L3 hit ns)
@@ -15,12 +18,6 @@ Usage:
 
 Notes:
   * Energy scope is LLC-only (nJ/event + W leakage).
-  * If a run's sim.cfg includes:
-       perf_model/l3_cache/llc/e_read_hit_pJ
-       perf_model/l3_cache/llc/e_write_hit_pJ
-       perf_model/l3_cache/llc/e_miss_pJ
-       perf_model/l3_cache/llc/p_leak_mW
-     those are parsed and used (converted to nJ/W). Otherwise we fall back to defaults.
 """
 
 import argparse
@@ -137,12 +134,11 @@ def to_int_or_zero(s):
 # =========================
 def read_llc_exact_from_db(run_dir):
     """
-    Return exact L3 stats from sim.stats.sqlite3 at ROI end:
-      A_db (loads+stores), M_db (load-misses+store-misses),
-      RH (l3_read_hits), WH (l3_write_hits),
-      WB (l3_writebacks), EV (l3_evictions),
-      M_custom (l3_misses custom counter)
-    Missing DB -> None
+    Return exact L3 stats from sim.stats.sqlite3 over the ROI (end - begin):
+      A_db (loads+stores on L3), M_db (load-misses+store-misses on L3),
+      RH, WH = l3_*_hits summed across ALL L3 slices (objectname LIKE 'L3%'),
+      WB, EV, M_custom on L3,
+      plus debug fields: RH_local/RH_remote/WH_local/WH_remote and prefetch counters and coh_upgrades.
     """
     db = os.path.join(run_dir, "sim.stats.sqlite3")
     if not os.path.exists(db):
@@ -151,50 +147,97 @@ def read_llc_exact_from_db(run_dir):
     with sqlite3.connect(db) as conn:
         cur = conn.cursor()
 
-        def sum_metrics(metrics):
-            in_clause = ",".join(["?"] * len(metrics))
-            sql = f"""
-                SELECT IFNULL(SUM(v.value),0)
-                FROM "values" v
-                JOIN names    n ON v.nameid   = n.nameid
-                JOIN prefixes p ON v.prefixid = p.prefixid
-                WHERE p.prefixname = ?
-                  AND n.objectname = 'L3'
-                  AND n.metricname IN ({in_clause});
-            """
-            params = ("roi-end",) + tuple(metrics)
-            cur.execute(sql, params)
-            return int(cur.fetchone()[0])
-
-        def one_metric(metric):
+        # ROI-delta helpers
+        def sum_delta_int_L3(metrics):
+            placeholders = ",".join(["?"] * len(metrics))
             sql = """
-                SELECT IFNULL(SUM(v.value),0)
+                SELECT COALESCE(SUM(
+                    CASE p.prefixname
+                        WHEN 'roi-end'   THEN v.value
+                        WHEN 'roi-begin' THEN -v.value
+                        ELSE 0
+                    END
+                ), 0)
                 FROM "values" v
                 JOIN names    n ON v.nameid   = n.nameid
                 JOIN prefixes p ON v.prefixid = p.prefixid
-                WHERE p.prefixname = ?
-                  AND n.objectname = 'L3'
-                  AND n.metricname = ?;
-            """
-            cur.execute(sql, ("roi-end", metric))
-            return int(cur.fetchone()[0])
+                WHERE n.objectname='L3'
+                  AND n.metricname IN ({})
+                  AND p.prefixname IN ('roi-begin','roi-end');
+            """.format(placeholders)
+            cur.execute(sql, tuple(metrics))
+            val = cur.fetchone()[0]
+            try:
+                return int(val or 0)
+            except Exception:
+                return int(float(val or 0.0))
 
-        A_db     = sum_metrics(("loads","stores"))
-        M_db     = sum_metrics(("load-misses","store-misses"))
-        RH       = one_metric("l3_read_hits")
-        WH       = one_metric("l3_write_hits")
-        WB       = one_metric("l3_writebacks")
-        EV       = one_metric("l3_evictions")
-        M_custom = one_metric("l3_misses")
+        def one_delta_int_L3(metric):
+            return sum_delta_int_L3((metric,))
 
-    return dict(A_db=A_db, M_db=M_db, RH=RH, WH=WH, WB=WB, EV=EV, M_custom=M_custom)
+        def sum_delta_int_like(metric, obj_like):
+            cur.execute("""
+                SELECT COALESCE(SUM(
+                    CASE p.prefixname
+                        WHEN 'roi-end'   THEN v.value
+                        WHEN 'roi-begin' THEN -v.value
+                        ELSE 0
+                    END
+                ), 0)
+                FROM "values" v
+                JOIN names    n ON v.nameid   = n.nameid
+                JOIN prefixes p ON v.prefixid = p.prefixid
+                WHERE n.metricname = ?
+                  AND n.objectname LIKE ?
+                  AND p.prefixname IN ('roi-begin','roi-end');
+            """, (metric, obj_like))
+            val = cur.fetchone()[0]
+            try:
+                return int(val or 0)
+            except Exception:
+                return int(float(val or 0.0))
+
+        # Accesses/misses from L3 only (same as before)
+        A_db     = sum_delta_int_L3(("loads", "stores"))
+        M_db     = sum_delta_int_L3(("load-misses", "store-misses"))
+
+        # Hits from ALL L3 slices (L3, L3.next_read, etc.)
+        RH_local = one_delta_int_L3("l3_read_hits")
+        RH_all   = sum_delta_int_like("l3_read_hits",  "L3%")
+        RH_remote = max(RH_all - RH_local, 0)
+
+        WH_local = one_delta_int_L3("l3_write_hits")
+        WH_all   = sum_delta_int_like("l3_write_hits", "L3%")
+        WH_remote = max(WH_all - WH_local, 0)
+
+        RH = RH_all
+        WH = WH_all
+
+        # Other L3-only counters
+        WB          = one_delta_int_L3("l3_writebacks")
+        EV          = one_delta_int_L3("l3_evictions")
+        M_custom    = one_delta_int_L3("l3_misses")
+        coh_upgrades= one_delta_int_L3("coherency-upgrades")
+
+        # Optional debug (may be zero on many benches)
+        hits_prefetch   = one_delta_int_L3("hits-prefetch")
+        loads_prefetch  = one_delta_int_L3("loads-prefetch")
+        stores_prefetch = one_delta_int_L3("stores-prefetch")
+        prefetches      = one_delta_int_L3("prefetches")
+
+    return dict(
+        A_db=A_db, M_db=M_db, RH=RH, WH=WH, WB=WB, EV=EV, M_custom=M_custom,
+        RH_local=RH_local, RH_remote=RH_remote, WH_local=WH_local, WH_remote=WH_remote,
+        hits_prefetch=hits_prefetch, loads_prefetch=loads_prefetch,
+        stores_prefetch=stores_prefetch, prefetches=prefetches,
+        coh_upgrades=coh_upgrades
+    )
 
 def read_llc_latency_from_db(run_dir):
     """
-    Return L3 latency/time buckets (ns) from sim.stats.sqlite3 at ROI end.
+    Return L3 latency/time buckets (ns) over ROI (end - begin):
       l3_total_latency_ns, l3_mshr_latency_ns, l3_snoop_latency_ns, l3_qbs_latency_ns
-      l3_uncore_time_sum_ns = sum of uncore-time-* components (safe)
-    Missing DB -> {}
+      l3_uncore_time_sum_ns = sum of uncore-time-* (safe)
     """
     db = os.path.join(run_dir, "sim.stats.sqlite3")
     if not os.path.exists(db):
@@ -202,43 +245,51 @@ def read_llc_latency_from_db(run_dir):
     with sqlite3.connect(db) as conn:
         cur = conn.cursor()
 
-        # Use total() so large counters don't overflow 64-bit SUM()
-        def one(metricname):
+        def one_delta_real(metricname):
             cur.execute("""
-                SELECT COALESCE(total(v.value), 0.0)
+                SELECT COALESCE(SUM(
+                    CASE p.prefixname
+                        WHEN 'roi-end'   THEN v.value*1.0
+                        WHEN 'roi-begin' THEN -v.value*1.0
+                        ELSE 0
+                    END
+                ), 0.0)
                 FROM "values" v
                 JOIN names    n ON v.nameid   = n.nameid
                 JOIN prefixes p ON v.prefixid = p.prefixid
-                WHERE p.prefixname = ?
-                  AND n.objectname = 'L3'
-                  AND n.metricname = ?;
-            """, ("roi-end", metricname))
+                WHERE n.objectname='L3'
+                  AND n.metricname = ?
+                  AND p.prefixname IN ('roi-begin','roi-end');
+            """, (metricname,))
             row = cur.fetchone()
-            return float(row[0]) if row and row[0] is not None else 0.0
+            return float(row[0] or 0.0)
 
         lat = {
-            "l3_total_latency_ns":  one("total-latency"),
-            "l3_mshr_latency_ns":   one("mshr-latency"),
-            "l3_snoop_latency_ns":  one("snoop-latency"),
-            "l3_qbs_latency_ns":    one("qbs-query-latency"),
+            "l3_total_latency_ns":  one_delta_real("total-latency"),
+            "l3_mshr_latency_ns":   one_delta_real("mshr-latency"),
+            "l3_snoop_latency_ns":  one_delta_real("snoop-latency"),
+            "l3_qbs_latency_ns":    one_delta_real("qbs-query-latency"),
         }
 
-        # Sum all uncore-time-* safely (again, use total())
+        # Sum all uncore-time-* over ROI
         cur.execute("""
-            SELECT n.metricname, COALESCE(total(v.value), 0.0)
+            SELECT COALESCE(SUM(
+                CASE p.prefixname
+                    WHEN 'roi-end'   THEN v.value*1.0
+                    WHEN 'roi-begin' THEN -v.value*1.0
+                    ELSE 0
+                END
+            ), 0.0)
             FROM "values" v
             JOIN names    n ON v.nameid   = n.nameid
             JOIN prefixes p ON v.prefixid = p.prefixid
-            WHERE p.prefixname = ?
-              AND n.objectname = 'L3'
+            WHERE n.objectname='L3'
               AND n.metricname LIKE 'uncore-time-%'
-            GROUP BY n.metricname;
-        """, ("roi-end",))
-        rows = cur.fetchall()
-        lat["l3_uncore_time_sum_ns"] = float(sum(val for _, val in rows)) if rows else 0.0
+              AND p.prefixname IN ('roi-begin','roi-end');
+        """)
+        lat["l3_uncore_time_sum_ns"] = float(cur.fetchone()[0] or 0.0)
 
     return lat
-
 
 def read_uncore_requests(run_dir):
     db = os.path.join(run_dir, "sim.stats.sqlite3")
@@ -247,29 +298,41 @@ def read_uncore_requests(run_dir):
     with sqlite3.connect(db) as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT IFNULL(SUM(v.value),0)
+            SELECT COALESCE(SUM(
+                CASE p.prefixname
+                    WHEN 'roi-end'   THEN v.value
+                    WHEN 'roi-begin' THEN -v.value
+                    ELSE 0
+                END
+            ), 0)
             FROM "values" v
             JOIN names    n ON v.nameid   = n.nameid
             JOIN prefixes p ON v.prefixid = p.prefixid
-            WHERE p.prefixname='roi-end'
-              AND n.objectname='L3'
-              AND n.metricname='uncore-requests';
+            WHERE n.objectname='L3'
+              AND n.metricname='uncore-requests'
+              AND p.prefixname IN ('roi-begin','roi-end');
         """)
         row = cur.fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
+        return int(row[0] or 0)
 
 def parse_llc_hit_cycles(run_dir):
     """
-    Read configured LLC hit cycles from sim.cfg.
-    Works with either:
-      [perf_model/l3_cache/llc]
-      read_hit_latency_cycles = 6
-      write_hit_latency_cycles = 17
-    or fully-qualified lines.
+    Return effective LLC read/write hit cycles.
+
+    Reads:
+      sim.cfg:
+        [perf_model/l3_cache/llc] and optional [perf_model/l3_cache/llc.next_read]
+        or fully-qualified perf_model/... keys.
+      sim.stats.sqlite3 (optional) to weight local vs remote hits over ROI.
+
+    Returns: (rd_cycles:int|None, wr_cycles:int|None)
     """
     cfg = os.path.join(run_dir, "sim.cfg")
-    rd = wr = None
+    rd_llc = wr_llc = None
+    rd_next = wr_next = None
     sect = None
+
+    # Parse sim.cfg
     if os.path.exists(cfg):
         try:
             with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
@@ -279,20 +342,117 @@ def parse_llc_hit_cycles(run_dir):
                         continue
                     m = re.match(r'\[(.+?)\]', line)
                     if m:
-                        sect = m.group(1).strip()
+                        sect = m.group(1).strip().lower()
                         continue
-                    m = re.match(r'perf_model/l3_cache/llc/read_hit_latency_cycles\s*=\s*([0-9]+)', line)
-                    if m: rd = int(m.group(1)); continue
-                    m = re.match(r'perf_model/l3_cache/llc/write_hit_latency_cycles\s*=\s*([0-9]+)', line)
-                    if m: wr = int(m.group(1)); continue
-                    if sect and sect.lower() == 'perf_model/l3_cache/llc':
-                        m = re.match(r'read_hit_latency_cycles\s*=\s*([0-9]+)', line)
-                        if m: rd = int(m.group(1)); continue
-                        m = re.match(r'write_hit_latency_cycles\s*=\s*([0-9]+)', line)
-                        if m: wr = int(m.group(1)); continue
+
+                    m = re.match(r'perf_model/l3_cache/llc(?:\.next_read)?/read_hit_latency_cycles\s*=\s*([0-9]+)', line, flags=re.I)
+                    if m:
+                        val = int(m.group(1))
+                        if ".next_read/" in line.lower():
+                            rd_next = val
+                        else:
+                            rd_llc = val
+                        continue
+
+                    m = re.match(r'perf_model/l3_cache/llc(?:\.next_read)?/write_hit_latency_cycles\s*=\s*([0-9]+)', line, flags=re.I)
+                    if m:
+                        val = int(m.group(1))
+                        if ".next_read/" in line.lower():
+                            wr_next = val
+                        else:
+                            wr_llc = val
+                        continue
+
+                    if sect in ("perf_model/l3_cache/llc", "perf_model/l3_cache/llc.next_read"):
+                        m = re.match(r'read_hit_latency_cycles\s*=\s*([0-9]+)', line, flags=re.I)
+                        if m:
+                            val = int(m.group(1))
+                            if sect.endswith(".next_read"):
+                                rd_next = val
+                            else:
+                                rd_llc = val
+                            continue
+                        m = re.match(r'write_hit_latency_cycles\s*=\s*([0-9]+)', line, flags=re.I)
+                        if m:
+                            val = int(m.group(1))
+                            if sect.endswith(".next_read"):
+                                wr_next = val
+                            else:
+                                wr_llc = val
+                            continue
         except Exception:
             pass
-    return rd, wr
+
+    have_llc  = (rd_llc is not None and wr_llc is not None)
+    have_next = (rd_next is not None and wr_next is not None)
+
+    if not have_llc and not have_next:
+        return None, None
+    if have_llc and not have_next:
+        return rd_llc, wr_llc
+    if have_next and not have_llc:
+        return rd_next, wr_next
+
+    # Weight by ROI-delta local vs remote hits (if DB is present)
+    db = os.path.join(run_dir, "sim.stats.sqlite3")
+    if not os.path.exists(db):
+        return rd_llc, wr_llc
+
+    def _roi_delta(cur, metric, obj_exact=None, obj_like=None):
+        if obj_exact is not None:
+            cur.execute("""
+                SELECT COALESCE(SUM(
+                    CASE p.prefixname
+                        WHEN 'roi-end'   THEN v.value
+                        WHEN 'roi-begin' THEN -v.value
+                        ELSE 0
+                    END
+                ), 0)
+                FROM "values" v
+                JOIN names    n ON v.nameid   = n.nameid
+                JOIN prefixes p ON v.prefixid = p.prefixid
+                WHERE n.metricname=? AND n.objectname=? AND p.prefixname IN ('roi-begin','roi-end');
+            """, (metric, obj_exact))
+        else:
+            cur.execute("""
+                SELECT COALESCE(SUM(
+                    CASE p.prefixname
+                        WHEN 'roi-end'   THEN v.value
+                        WHEN 'roi-begin' THEN -v.value
+                        ELSE 0
+                    END
+                ), 0)
+                FROM "values" v
+                JOIN names    n ON v.nameid   = n.nameid
+                JOIN prefixes p ON v.prefixid = p.prefixid
+                WHERE n.metricname=? AND n.objectname LIKE ? AND p.prefixname IN ('roi-begin','roi-end');
+            """, (metric, obj_like))
+        row = cur.fetchone()
+        try:
+            return int(row[0] or 0)
+        except Exception:
+            return int(float(row[0] or 0.0))
+
+    try:
+        with sqlite3.connect(db) as conn:
+            cur = conn.cursor()
+            RH_local = _roi_delta(cur, "l3_read_hits",  obj_exact="L3")
+            RH_all   = _roi_delta(cur, "l3_read_hits",  obj_like="L3%")
+            WH_local = _roi_delta(cur, "l3_write_hits", obj_exact="L3")
+            WH_all   = _roi_delta(cur, "l3_write_hits", obj_like="L3%")
+    except Exception:
+        return rd_llc, wr_llc
+
+    RH_remote = max(RH_all - RH_local, 0)
+    WH_remote = max(WH_all - WH_local, 0)
+
+    rd_total = RH_local + RH_remote
+    wr_total = WH_local + WH_remote
+
+    rd_eff = rd_llc if rd_total == 0 else int(round((RH_local*rd_llc + RH_remote*(rd_next if rd_next is not None else rd_llc)) / float(rd_total)))
+    wr_eff = wr_llc if wr_total == 0 else int(round((WH_local*wr_llc + WH_remote*(wr_next if wr_next is not None else wr_llc)) / float(wr_total)))
+
+    return rd_eff, wr_eff
 
 def avg_l3_hit_ns(rd_cyc, wr_cyc, RH, WH, period_ns):
     """
@@ -328,7 +488,6 @@ def parse_llc_energy_consts(run_dir):
     Returns dict in nJ/W on success, else None.
     """
     def _scan_text(txt):
-        # works for both "e_read_hit_pJ=397" and "--perf_model/.../e_read_hit_pJ=397 "
         patt = {
             "E_hit_nJ":  r'perf_model/l3_cache/llc/e_read_hit_pJ\s*=\s*([0-9.]+)',
             "E_write_nJ":r'perf_model/l3_cache/llc/e_write_hit_pJ\s*=\s*([0-9.]+)',
@@ -347,7 +506,6 @@ def parse_llc_energy_consts(run_dir):
                 out[k] = val / 1000.0  # pJ -> nJ
         return out
 
-    # 1) sim.cfg
     cfg = os.path.join(run_dir, "sim.cfg")
     if os.path.exists(cfg):
         try:
@@ -357,7 +515,6 @@ def parse_llc_energy_consts(run_dir):
         except Exception:
             pass
 
-    # 2) sim.info
     info = os.path.join(run_dir, "sim.info")
     if os.path.exists(info):
         try:
@@ -367,7 +524,6 @@ def parse_llc_energy_consts(run_dir):
         except Exception:
             pass
 
-    # 3) sim.inf (seen in your logs for a few benches)
     info_alt = os.path.join(run_dir, "sim.inf")
     if os.path.exists(info_alt):
         try:
@@ -395,6 +551,36 @@ def ed2p(E_J, T_s):
     if not (E_J == E_J) or not (T_s == T_s):
         return float('nan')
     return E_J * (T_s ** 2)
+
+# =========================
+# Reconcile missing hits (coherency upgrades etc.) for energy
+# =========================
+def reconcile_hits_for_energy(db):
+    """
+    Ensure RH+WH == (A_db - M_db) by allocating the missing hits (gap)
+    primarily to writes (coherency upgrades), then split any remainder
+    proportionally by the observed RH:WH ratio (or 50/50 if none).
+    Returns: RH_use, WH_use, gap
+    """
+    if not db:
+        return 0, 0, 0
+    H_tot = max((db["A_db"] - db["M_db"]), 0)
+    RHc, WHc = db["RH"] or 0, db["WH"] or 0
+    counted = RHc + WHc
+    gap = H_tot - counted
+    if gap <= 0:
+        return RHc, WHc, 0
+
+    # allocate as write-like hits up to coh_upgrades
+    add_w = min(gap, db.get("coh_upgrades") or 0)
+    RH_use, WH_use = RHc, WHc + add_w
+    rem = gap - add_w
+    if rem > 0:
+        denom = counted if counted > 0 else 2
+        r = (RHc / denom) if counted > 0 else 0.5
+        RH_use += int(round(rem * r))
+        WH_use  = H_tot - RH_use
+    return RH_use, WH_use, gap
 
 # =========================
 # CSV writer (overwrite)
@@ -449,10 +635,17 @@ def main():
 
     s_period_ns = period_ns_from_parsed(sram_parsed)
     n_period_ns = period_ns_from_parsed(jans_parsed)
+
     s_rd_cyc, s_wr_cyc = parse_llc_hit_cycles(sram_dir)
     n_rd_cyc, n_wr_cyc = parse_llc_hit_cycles(jans_dir)
-    s_avg_hit_ns = avg_l3_hit_ns(s_rd_cyc, s_wr_cyc, s_db["RH"] if s_db else None, s_db["WH"] if s_db else None, s_period_ns)
-    n_avg_hit_ns = avg_l3_hit_ns(n_rd_cyc, n_wr_cyc, n_db["RH"] if n_db else None, n_db["WH"] if n_db else None, n_period_ns)
+
+    # Rebalance hits for energy use (accounts for coherency upgrades)
+    s_RH_use, s_WH_use, s_gap = reconcile_hits_for_energy(s_db) if s_db else (0, 0, 0)
+    n_RH_use, n_WH_use, n_gap = reconcile_hits_for_energy(n_db) if n_db else (0, 0, 0)
+
+    # Avg hit ns based on effective cycles and rebalanced hit mix
+    s_avg_hit_ns = avg_l3_hit_ns(s_rd_cyc, s_wr_cyc, s_RH_use, s_WH_use, s_period_ns)
+    n_avg_hit_ns = avg_l3_hit_ns(n_rd_cyc, n_wr_cyc, n_RH_use, n_WH_use, n_period_ns)
 
     # uncore requests and per-request time
     s_unc_reqs = read_uncore_requests(sram_dir)
@@ -470,7 +663,7 @@ def main():
     (n_Elo, n_Ehi), (nd_lo, nd_hi), n_leakJ = energy_bounds(
         **n_consts, T_s=T_n, acc=A_n_txt, mis=M_n_txt)
 
-    # Exact energies
+    # Exact energies (using rebalanced hits)
     s_dyn_exact = s_E_exact = float('nan')
     n_dyn_exact = n_E_exact = float('nan')
     s_exact_src = n_exact_src = ""
@@ -478,10 +671,18 @@ def main():
     n_leakW = n_consts["P_leak_W"]
 
     def mismatch_note(d):
-        if d is None: return "sqlite_missing"
-        A, M, RH, WH = d["A_db"], d["M_db"], d["RH"], d["WH"]
-        diff = (A - M) - (RH + WH)
-        return "ok" if diff == 0 else f"warn_A-M!=RH+WH(diff={diff})"
+        if d is None:
+            return "sqlite_missing"
+        other = (d["A_db"] - d["M_db"]) - (d["RH"] + d["WH"])
+        if -2 <= other <= 2:  # tolerate ±2 boundary jitter
+            return "ok"
+        up = d.get("coh_upgrades", 0)
+        hp = d.get("hits_prefetch", 0)
+        extras = []
+        if up: extras.append(f"upgrades={up}")
+        if hp: extras.append(f"hits_prefetch={hp}")
+        suffix = ("; " + ", ".join(extras)) if extras else ""
+        return f"warn_A-M!=RH+WH(diff={other}{suffix})"
 
     s_note = mismatch_note(s_db)
     n_note = mismatch_note(n_db)
@@ -489,16 +690,16 @@ def main():
     if s_db is not None:
         s_dyn_exact, s_E_exact = energy_exact_from_counts(
             s_consts["E_hit_nJ"], s_consts["E_miss_nJ"], s_consts["E_write_nJ"], s_leakW, T_s,
-            s_db["RH"], s_db["WH"], s_db["M_db"]
+            s_RH_use, s_WH_use, s_db["M_db"]
         )
-        s_exact_src = "sqlite"
+        s_exact_src = "sqlite" + ("+rebalanced" if s_gap > 0 else "")
 
     if n_db is not None:
         n_dyn_exact, n_E_exact = energy_exact_from_counts(
             n_consts["E_hit_nJ"], n_consts["E_miss_nJ"], n_consts["E_write_nJ"], n_leakW, T_n,
-            n_db["RH"], n_db["WH"], n_db["M_db"]
+            n_RH_use, n_WH_use, n_db["M_db"]
         )
-        n_exact_src = "sqlite"
+        n_exact_src = "sqlite" + ("+rebalanced" if n_gap > 0 else "")
 
     # ===== energy_bounds.csv =====
     energy_path = os.path.join(out_dir, "energy_bounds.csv")
@@ -614,3 +815,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

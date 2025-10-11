@@ -1,0 +1,32 @@
+# Auto-generated from NVSim for 14nm, 128MB, 8-way
+script: scripts/run_all.sbatch
+sbatch_args:
+  - --job-name=sniper-llc-14nm-128mb-16w
+  - --output=logs/%x-%A_%a.out
+  - --error=logs/%x-%A_%a.err
+
+env:
+  SKIP_TRACE: 1
+  SPEC_SIZE: ref
+  SIM_N: 4
+  ROI_M: 1000
+  WARMUP_M: 100
+  OUT_ROOT: "${PWD}/results/sniper_llc_14nm_128mb_8w_{timestamp}"
+
+llc:
+  sram:
+    # ---- pulled from NVSim summary ----
+    size_bytes: 134217728
+    assoc_ways: 16
+    line_bytes: 64
+    bus_width_bits: 512
+    temp_k: 300
+    tech_node_nm: 14
+    read_hit_cycles: 1110
+    write_hit_cycles: 722
+    energy:
+      enabled: true
+      e_read_hit_pJ: 4427
+      e_write_hit_pJ: 48
+      e_miss_pJ: 4427
+      p_leak_mW: 559.368
